@@ -26,6 +26,11 @@ services:
       # --- Dispatcher public URL (for deploy links in notifications) ---
       DISPATCHER_URL: "https://dispatcher.example.com"
 
+      # --- Containers to ignore (comma-separated) ---
+      # Containers in this list will not trigger notifications
+      # Example: coolify-proxy,coolify-redis,coolify-sentinel,coolify-db,coolify-realtime,coolify
+      IGNORE_CONTAINERS: ""
+
     # --- Traefik example (adapt entrypoints to your setup) ---
     labels:
       - "traefik.enable=true"

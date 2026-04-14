@@ -160,6 +160,13 @@ async def diun_webhook(request: Request):
         logger.info(f"Ignoring status={status}")
         return JSONResponse({"ok": True, "action": "ignored"})
 
+    # Check if container is in ignore list
+    ignore_containers_raw = os.getenv("IGNORE_CONTAINERS", "").strip()
+    ignore_containers = [c.strip() for c in ignore_containers_raw.split(",") if c.strip()]
+    if container_name in ignore_containers:
+        logger.info(f"Container {container_name} is in ignore list, skipping notification")
+        return JSONResponse({"ok": True, "action": "ignored"})
+
     apprise_urls = load_apprise_urls()
 
     coolify_url = os.getenv("COOLIFY_URL", "").strip()
