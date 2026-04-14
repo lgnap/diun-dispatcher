@@ -1,0 +1,49 @@
+services:
+  diun-dispatcher:
+    image: ghcr.io/lgnap/diun-dispatcher:latest
+    container_name: diun-dispatcher
+    restart: unless-stopped
+    environment:
+      # --- Coolify ---
+      COOLIFY_URL: "https://coolify.example.com"
+      COOLIFY_TOKEN: "your-coolify-api-token"
+
+      # --- Notifications via Apprise (comma-separated) ---
+      # Pushover  : pover://USER_KEY@APP_TOKEN
+      # ntfy      : ntfy://ntfy.example.com/topic
+      # Telegram  : tgram://BOTTOKEN/CHATID
+      # Gotify    : gotify://hostname/token
+      # Discord   : discord://webhook_id/webhook_token
+      # Full list : https://github.com/caronc/apprise/wiki
+      APPRISE_URLS: "pover://USER_KEY@APP_TOKEN"
+
+      # --- Optional: shared secret with Diun ---
+      WEBHOOK_SECRET: "change-me"
+
+      # --- Mappings: hostname -> container -> Coolify UUID ---
+      # Must be valid JSON (use single line or block scalar)
+      MAPPINGS: |
+        {
+          "my-server": {
+            "ntfy": "coolify-uuid-aaa",
+            "vaultwarden": "coolify-uuid-bbb"
+          },
+          "my-other-server": {
+            "uptime-kuma": "coolify-uuid-ccc"
+          }
+        }
+
+    # --- Traefik example (adapt entrypoints to your setup) ---
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.diun-dispatcher.rule=Host(`diun-dispatcher.example.com`)"
+      - "traefik.http.routers.diun-dispatcher.entrypoints=websecure"
+      - "traefik.http.routers.diun-dispatcher.tls.certresolver=letsencrypt"
+      - "traefik.http.services.diun-dispatcher.loadbalancer.server.port=8000"
+
+    networks:
+      - web
+
+networks:
+  web:
+    external: true
