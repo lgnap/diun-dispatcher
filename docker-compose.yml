@@ -6,30 +6,7 @@ services:
     restart: unless-stopped
     ports:
       - '8000:8000'
-    environment:
-      # --- Coolify ---
-      COOLIFY_URL: "https://coolify.example.com"
-      COOLIFY_TOKEN: "[REDACTED_TOKEN]"
-
-      # --- Notifications via Apprise (comma-separated) ---
-      # Pushover  : pover://USER_KEY@APP_TOKEN
-      # ntfy      : ntfy://ntfy.example.com/topic
-      # Telegram  : tgram://BOTTOKEN/CHATID
-      # Gotify    : gotify://hostname/token
-      # Discord   : discord://webhook_id/webhook_token
-      # Full list : https://github.com/caronc/apprise/wiki
-      APPRISE_URLS: "[REDACTED_PUSHOVER_KEY]"
-
-      # --- Optional: shared secret with Diun ---
-      WEBHOOK_SECRET: "[REDACTED_SECRET]"
-
-      # --- Dispatcher public URL (for deploy links in notifications) ---
-      DISPATCHER_URL: "https://dispatcher.example.com"
-
-      # --- Containers to ignore (comma-separated) ---
-      # Containers in this list will not trigger notifications
-      # Example: coolify-proxy,coolify-redis,coolify-sentinel,coolify-db,coolify-realtime,coolify
-      IGNORE_CONTAINERS: ""
+    env_file: .env
 
     # --- Traefik example (adapt entrypoints to your setup) ---
     labels:
