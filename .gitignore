@@ -1,7 +1,8 @@
 __pycache__/
 *.pyc
 .env
-.env.*
+.env.local
+.env.*.local
 *.egg-info/
 dist/
 docker-compose.yml
