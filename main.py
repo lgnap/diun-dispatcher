@@ -110,17 +110,13 @@ async def diun_webhook(request: Request):
             logger.warning("Invalid webhook secret")
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-    meta = data.get("meta", {})
-    entry = data.get("entry", {})
+    logger.info(f"Received webhook payload: {json.dumps(data, indent=2)}")
 
-    hostname = meta.get("hostname", "unknown")
-    status = entry.get("status", "")
-    image = entry.get("image", "unknown")
-    container_name = (
-        entry.get("container", {}).get("name")
-        or entry.get("metadata", {}).get("container_name")
-        or "unknown"
-    )
+    hostname = data.get("hostname", "unknown")
+    status = data.get("status", "")
+    image = data.get("image", "unknown")
+    metadata = data.get("metadata", {})
+    container_name = metadata.get("ctn_names", "unknown")
 
     logger.info(f"Event: hostname={hostname} container={container_name} image={image} status={status}")
 
