@@ -23,6 +23,9 @@ services:
       # --- Optional: shared secret with Diun ---
       WEBHOOK_SECRET: "[REDACTED_SECRET]"
 
+      # --- Dispatcher public URL (for deploy links in notifications) ---
+      DISPATCHER_URL: "https://dispatcher.example.com"
+
     # --- Traefik example (adapt entrypoints to your setup) ---
     labels:
       - "traefik.enable=true"

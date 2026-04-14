@@ -155,28 +155,51 @@ async def diun_webhook(request: Request):
     coolify_url = os.getenv("COOLIFY_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
-    deployed = False
+    uuid = None
+    deploy_link = ""
     if coolify_url and coolify_token:
         services = await get_coolify_applications(coolify_url, coolify_token)
         uuid = find_service_uuid_by_image(services, image)
         if uuid:
-            deployed = await trigger_coolify(coolify_url, coolify_token, uuid)
+            dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
+            webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+            if dispatcher_url:
+                deploy_link = f"\n\n🚀 Déployer: {dispatcher_url}/deploy?uuid={uuid}&secret={webhook_secret}"
     else:
         logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
     status_emoji = "🆕" if status == "new" else "⬆�"
-    deploy_line = "✅ Coolify redeploy triggered" if deployed else "⚠� No Coolify mapping configured"
+    available_text = "new image available" if uuid else "new image (no deploy available)"
 
-    title = f"{status_emoji} {container_name} — new image available"
+    title = f"{status_emoji} {container_name} — {available_text}"
     body = (
         f"🖥� Server: {hostname}\n"
         f"� Image: {image}\n"
-        f"📦 Container: {container_name}\n"
-        f"{deploy_line}"
+        f"📦 Container: {container_name}"
+        f"{deploy_link}"
     )
 
     send_notification(apprise_urls, title, body)
 
+    return JSONResponse({"ok": True, "uuid": uuid})
+
+
+@app.get("/deploy")
+async def manual_deploy(uuid: str, secret: str = ""):
+    """Manually trigger a Coolify deployment"""
+    # Validate secret
+    expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if expected_secret and secret != expected_secret:
+        logger.warning(f"Invalid deploy secret")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+
+    if not coolify_url or not coolify_token:
+        raise HTTPException(status_code=500, detail="Coolify not configured")
+
+    deployed = await trigger_coolify(coolify_url, coolify_token, uuid)
     return JSONResponse({"ok": True, "deployed": deployed})
 
 
