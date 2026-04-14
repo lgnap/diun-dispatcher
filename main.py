@@ -51,10 +51,20 @@ def load_apprise_urls() -> list[str]:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def normalize_image(image: str) -> str:
+    """Normalize image name by removing default docker.io registry if present"""
+    # Remove tag
+    base = image.split(":")[0] if ":" in image else image
+    # Remove docker.io prefix (it's implicit when not specified)
+    if base.startswith("docker.io/"):
+        base = base[len("docker.io/"):]
+    return base
+
+
 def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
     """Find service UUID by matching Docker image name within applications/databases"""
-    # Extract base image name (e.g., "ghcr.io/music-assistant/server" from "ghcr.io/music-assistant/server:latest")
-    image_base = image.split(":")[0] if ":" in image else image
+    # Normalize the incoming image
+    image_normalized = normalize_image(image)
 
     for service in services:
         # Check applications within the service
@@ -63,9 +73,9 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
             if not app_image:
                 continue
 
-            app_image_base = app_image.split(":")[0] if ":" in app_image else app_image
+            app_image_normalized = normalize_image(app_image)
 
-            if app_image_base == image_base:
+            if app_image_normalized == image_normalized:
                 service_uuid = service.get("uuid")
                 logger.info(f"Found matching service uuid={service_uuid} for image={image}")
                 return service_uuid
@@ -76,9 +86,9 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
             if not db_image:
                 continue
 
-            db_image_base = db_image.split(":")[0] if ":" in db_image else db_image
+            db_image_normalized = normalize_image(db_image)
 
-            if db_image_base == image_base:
+            if db_image_normalized == image_normalized:
                 service_uuid = service.get("uuid")
                 logger.info(f"Found matching service uuid={service_uuid} for image={image}")
                 return service_uuid

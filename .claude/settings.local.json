@@ -12,7 +12,8 @@
       "Bash(curl -X POST http://localhost:8000/webhook -H 'Content-Type: application/json' -H 'X-Diun-Secret: [REDACTED_SECRET]' -d '{:*)",
       "Bash(curl -s https://coolify.example.com/api/v1/services -H 'Authorization: Bearer [REDACTED_TOKEN]')",
       "Bash(python3 -m json.tool)",
-      "Bash(curl -s -X POST http://localhost:8000/webhook -H 'Content-Type: application/json' -H 'X-Diun-Secret: [REDACTED_SECRET]' -d '{\"image\":\"ghcr.io/music-assistant/server:latest\",\"status\":\"new\",\"metadata\":{\"ctn_names\":\"test\"}}')"
+      "Bash(curl -s -X POST http://localhost:8000/webhook -H 'Content-Type: application/json' -H 'X-Diun-Secret: [REDACTED_SECRET]' -d '{\"image\":\"ghcr.io/music-assistant/server:latest\",\"status\":\"new\",\"metadata\":{\"ctn_names\":\"test\"}}')",
+      "Bash(python3:*)"
     ]
   }
 }
