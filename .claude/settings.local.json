@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose up:*)",
+      "Bash(docker compose start:*)",
+      "Bash(curl -X POST http://localhost:8000/webhook -H 'Content-Type: application/json' -d '{:*)",
+      "Bash(docker compose logs:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m 'fix: correct webhook payload parsing for Diun webhook structure:*)",
+      "Bash(docker compose down:*)",
+      "WebFetch(domain:coolify.io)"
+    ]
+  }
+}

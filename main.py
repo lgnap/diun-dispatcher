@@ -24,24 +24,18 @@ def get_env(key: str, required: bool = True) -> str:
     return val
 
 
-def load_mappings() -> dict:
-    """
-    MAPPINGS is a JSON env var:
-    {
-      "my-server": {
-        "ntfy": "coolify-uuid-aaa",
-        "vaultwarden": "coolify-uuid-bbb"
-      },
-      "my-other-server": {
-        "uptime-kuma": "coolify-uuid-ccc"
-      }
-    }
-    """
-    raw = os.getenv("MAPPINGS", "{}")
+async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list[dict]:
+    """Fetch all applications from Coolify API"""
+    url = f"{coolify_url.rstrip('/')}/api/v1/applications"
+    headers = {"Authorization": f"Bearer {coolify_token}"}
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Invalid MAPPINGS JSON: {e}")
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch Coolify applications: {e}")
+        return []
 
 
 def load_apprise_urls() -> list[str]:
@@ -57,8 +51,12 @@ def load_apprise_urls() -> list[str]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_coolify_uuid(mappings: dict, hostname: str, container: str) -> str | None:
-    return mappings.get(hostname, {}).get(container)
+def find_app_uuid(applications: list[dict], container_name: str) -> str | None:
+    """Find application UUID by matching container name with app name"""
+    for app in applications:
+        if app.get("name") == container_name:
+            return app.get("uuid")
+    return None
 
 
 async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> bool:
@@ -124,19 +122,21 @@ async def diun_webhook(request: Request):
         logger.info(f"Ignoring status={status}")
         return JSONResponse({"ok": True, "action": "ignored"})
 
-    mappings = load_mappings()
     apprise_urls = load_apprise_urls()
 
     coolify_url = os.getenv("COOLIFY_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
-    uuid = get_coolify_uuid(mappings, hostname, container_name)
     deployed = False
-
-    if uuid and coolify_url and coolify_token:
-        deployed = await trigger_coolify(coolify_url, coolify_token, uuid)
+    if coolify_url and coolify_token:
+        applications = await get_coolify_applications(coolify_url, coolify_token)
+        uuid = find_app_uuid(applications, container_name)
+        if uuid:
+            deployed = await trigger_coolify(coolify_url, coolify_token, uuid)
+        else:
+            logger.warning(f"No Coolify application found for container={container_name}")
     else:
-        logger.warning(f"No Coolify mapping for hostname={hostname} container={container_name}")
+        logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
     status_emoji = "🆕" if status == "new" else "⬆�"
     deploy_line = "✅ Coolify redeploy triggered" if deployed else "⚠� No Coolify mapping configured"

@@ -1,8 +1,11 @@
 services:
   diun-dispatcher:
+    #    build: .
     image: ghcr.io/lgnap/diun-dispatcher:latest
     container_name: diun-dispatcher
     restart: unless-stopped
+    ports:
+      - '8000:8000'
     environment:
       # --- Coolify ---
       COOLIFY_URL: "https://coolify.example.com"
@@ -18,20 +21,7 @@ services:
       APPRISE_URLS: "pover://USER_KEY@APP_TOKEN"
 
       # --- Optional: shared secret with Diun ---
-      WEBHOOK_SECRET: "change-me"
-
-      # --- Mappings: hostname -> container -> Coolify UUID ---
-      # Must be valid JSON (use single line or block scalar)
-      MAPPINGS: |
-        {
-          "my-server": {
-            "ntfy": "coolify-uuid-aaa",
-            "vaultwarden": "coolify-uuid-bbb"
-          },
-          "my-other-server": {
-            "uptime-kuma": "coolify-uuid-ccc"
-          }
-        }
+      WEBHOOK_SECRET: "your-webhook-secret-here"
 
     # --- Traefik example (adapt entrypoints to your setup) ---
     labels:
