@@ -1,7 +1,7 @@
 services:
   diun-dispatcher:
-    #    build: .
-    image: ghcr.io/lgnap/diun-dispatcher:latest
+    build: .
+    # image: ghcr.io/lgnap/diun-dispatcher:latest
     container_name: diun-dispatcher
     restart: unless-stopped
     ports:
@@ -9,7 +9,7 @@ services:
     environment:
       # --- Coolify ---
       COOLIFY_URL: "https://coolify.example.com"
-      COOLIFY_TOKEN: "your-coolify-api-token"
+      COOLIFY_TOKEN: "[REDACTED_TOKEN]"
 
       # --- Notifications via Apprise (comma-separated) ---
       # Pushover  : pover://USER_KEY@APP_TOKEN
@@ -18,10 +18,10 @@ services:
       # Gotify    : gotify://hostname/token
       # Discord   : discord://webhook_id/webhook_token
       # Full list : https://github.com/caronc/apprise/wiki
-      APPRISE_URLS: "pover://USER_KEY@APP_TOKEN"
+      APPRISE_URLS: "[REDACTED_PUSHOVER_KEY]"
 
       # --- Optional: shared secret with Diun ---
-      WEBHOOK_SECRET: "your-webhook-secret-here"
+      WEBHOOK_SECRET: "[REDACTED_SECRET]"
 
     # --- Traefik example (adapt entrypoints to your setup) ---
     labels:

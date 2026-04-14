@@ -8,7 +8,11 @@
       "Bash(git add:*)",
       "Bash(git commit -m 'fix: correct webhook payload parsing for Diun webhook structure:*)",
       "Bash(docker compose down:*)",
-      "WebFetch(domain:coolify.io)"
+      "WebFetch(domain:coolify.io)",
+      "Bash(curl -X POST http://localhost:8000/webhook -H 'Content-Type: application/json' -H 'X-Diun-Secret: [REDACTED_SECRET]' -d '{:*)",
+      "Bash(curl -s https://coolify.example.com/api/v1/services -H 'Authorization: Bearer [REDACTED_TOKEN]')",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s -X POST http://localhost:8000/webhook -H 'Content-Type: application/json' -H 'X-Diun-Secret: [REDACTED_SECRET]' -d '{\"image\":\"ghcr.io/music-assistant/server:latest\",\"status\":\"new\",\"metadata\":{\"ctn_names\":\"test\"}}')"
     ]
   }
 }

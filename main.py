@@ -25,8 +25,8 @@ def get_env(key: str, required: bool = True) -> str:
 
 
 async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list[dict]:
-    """Fetch all applications from Coolify API"""
-    url = f"{coolify_url.rstrip('/')}/api/v1/applications"
+    """Fetch all services/applications from Coolify API"""
+    url = f"{coolify_url.rstrip('/')}/api/v1/services"
     headers = {"Authorization": f"Bearer {coolify_token}"}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -34,7 +34,7 @@ async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
-        logger.error(f"Failed to fetch Coolify applications: {e}")
+        logger.error(f"Failed to fetch Coolify services: {e}")
         return []
 
 
@@ -51,11 +51,39 @@ def load_apprise_urls() -> list[str]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def find_app_uuid(applications: list[dict], container_name: str) -> str | None:
-    """Find application UUID by matching container name with app name"""
-    for app in applications:
-        if app.get("name") == container_name:
-            return app.get("uuid")
+def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
+    """Find service UUID by matching Docker image name within applications/databases"""
+    # Extract base image name (e.g., "ghcr.io/music-assistant/server" from "ghcr.io/music-assistant/server:latest")
+    image_base = image.split(":")[0] if ":" in image else image
+
+    for service in services:
+        # Check applications within the service
+        for app in service.get("applications", []):
+            app_image = app.get("image", "")
+            if not app_image:
+                continue
+
+            app_image_base = app_image.split(":")[0] if ":" in app_image else app_image
+
+            if app_image_base == image_base:
+                service_uuid = service.get("uuid")
+                logger.info(f"Found matching service uuid={service_uuid} for image={image}")
+                return service_uuid
+
+        # Also check databases within the service
+        for db in service.get("databases", []):
+            db_image = db.get("image", "")
+            if not db_image:
+                continue
+
+            db_image_base = db_image.split(":")[0] if ":" in db_image else db_image
+
+            if db_image_base == image_base:
+                service_uuid = service.get("uuid")
+                logger.info(f"Found matching service uuid={service_uuid} for image={image}")
+                return service_uuid
+
+    logger.warning(f"No application found for image={image}")
     return None
 
 
@@ -129,12 +157,10 @@ async def diun_webhook(request: Request):
 
     deployed = False
     if coolify_url and coolify_token:
-        applications = await get_coolify_applications(coolify_url, coolify_token)
-        uuid = find_app_uuid(applications, container_name)
+        services = await get_coolify_applications(coolify_url, coolify_token)
+        uuid = find_service_uuid_by_image(services, image)
         if uuid:
             deployed = await trigger_coolify(coolify_url, coolify_token, uuid)
-        else:
-            logger.warning(f"No Coolify application found for container={container_name}")
     else:
         logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
