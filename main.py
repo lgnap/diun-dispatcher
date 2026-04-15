@@ -28,7 +28,10 @@ def get_env(key: str, required: bool = True) -> str:
 async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list[dict]:
     """Fetch all services/applications from Coolify API"""
     url = f"{coolify_url.rstrip('/')}/api/v1/services"
-    headers = {"Authorization": f"Bearer {coolify_token}"}
+    headers = {
+        "Authorization": f"Bearer {coolify_token}",
+        **get_cloudflare_headers()
+    }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers=headers)
