@@ -4,6 +4,8 @@ import json
 import logging
 import apprise
 import httpx
+import time
+from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -12,6 +14,106 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Diun Webhook Dispatcher")
+
+# UUID cache configuration
+CACHE_FILE = Path(os.getenv("CACHE_FILE", "/data/uuid_cache.json"))
+CACHE_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days
+CACHE_MAX_ENTRIES = 100
+SHORT_UUID_LENGTH = 8
+
+# In-memory cache (loaded from disk at startup)
+_uuid_cache: dict = {}
+_cache_dirty = False
+
+
+# ---------------------------------------------------------------------------
+# UUID Cache functions (in-memory with lazy disk persistence)
+# ---------------------------------------------------------------------------
+
+def _is_entry_expired(entry: dict, now: float = None) -> bool:
+    """Check if a cache entry has expired"""
+    if now is None:
+        now = time.time()
+    return (now - entry.get('timestamp', 0)) >= CACHE_TTL_SECONDS
+
+
+def _clean_expired_entries() -> None:
+    """Remove expired entries from in-memory cache"""
+    global _uuid_cache
+    now = time.time()
+    original_size = len(_uuid_cache)
+    _uuid_cache = {k: v for k, v in _uuid_cache.items() if not _is_entry_expired(v, now)}
+    if len(_uuid_cache) < original_size:
+        logger.info(f"Cleaned {original_size - len(_uuid_cache)} expired cache entries")
+
+
+def _load_cache_from_disk() -> None:
+    """Load UUID cache from disk into memory"""
+    global _uuid_cache, _cache_dirty
+    if not CACHE_FILE.exists():
+        _uuid_cache = {}
+        return
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            _uuid_cache = json.load(f)
+        _clean_expired_entries()
+        _cache_dirty = False
+        logger.info(f"Loaded cache from disk: {len(_uuid_cache)} entries")
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        logger.warning(f"Failed to load cache from disk: {e}")
+        _uuid_cache = {}
+
+
+def _save_cache_to_disk() -> None:
+    """Save in-memory cache to disk"""
+    global _cache_dirty
+    if not _cache_dirty or not _uuid_cache:
+        return
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(_uuid_cache, f, separators=(',', ':'))
+        _cache_dirty = False
+        logger.info(f"Saved cache to disk: {len(_uuid_cache)} entries")
+    except (IOError, OSError) as e:
+        logger.error(f"Failed to save cache to disk: {e}")
+
+
+def cache_uuid(uuid_short: str, uuid_full: str) -> None:
+    """Cache a UUID mapping (in-memory, lazy disk persistence)"""
+    global _uuid_cache, _cache_dirty
+    now = time.time()
+
+    # If at capacity, remove oldest entry
+    if len(_uuid_cache) >= CACHE_MAX_ENTRIES:
+        oldest_key = min(_uuid_cache.keys(), key=lambda k: _uuid_cache[k].get('timestamp', 0))
+        del _uuid_cache[oldest_key]
+
+    # Add new entry
+    _uuid_cache[uuid_short] = {
+        'uuid_full': uuid_full,
+        'timestamp': now
+    }
+    _cache_dirty = True
+    logger.info(f"Cached UUID: {uuid_short} → {uuid_full}")
+
+
+def get_uuid_from_cache(uuid_short: str) -> str | None:
+    """Retrieve full UUID from cache (O(1) in-memory lookup)"""
+    global _uuid_cache, _cache_dirty
+
+    if uuid_short not in _uuid_cache:
+        return None
+
+    entry = _uuid_cache[uuid_short]
+
+    if _is_entry_expired(entry):
+        # Remove expired entry
+        del _uuid_cache[uuid_short]
+        _cache_dirty = True
+        return None
+
+    return entry.get('uuid_full')
 
 
 # ---------------------------------------------------------------------------
@@ -205,13 +307,20 @@ def send_notification(urls: list[str], title: str, body: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Startup event
+# Startup/Shutdown events
 # ---------------------------------------------------------------------------
 
 @app.on_event("startup")
 async def startup_event():
-    """Log configuration on application startup"""
+    """Initialize cache and log configuration on application startup"""
+    _load_cache_from_disk()
     log_environment_config()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Save cache to disk on application shutdown"""
+    _save_cache_to_disk()
 
 
 # ---------------------------------------------------------------------------
@@ -286,16 +395,22 @@ async def diun_webhook(request: Request):
             dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
             webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
             if dispatcher_url:
-                deploy_link = f"\n\n🚀 Déployer: {dispatcher_url}/deploy?uuid={uuid}&secret={webhook_secret}"
+                # Use short UUID in the link, cache the mapping
+                uuid_short = uuid[:8]
+                cache_uuid(uuid_short, uuid)
+                deploy_link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}&secret={webhook_secret}"
     else:
         logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
     status_emoji = "🆕" if status == "new" else "⬆️"
     available_text = "new image available" if uuid else "new image (no deploy available)"
 
+    # Shorten server hostname (keep only the first part before domain)
+    server_display = hostname.split('.')[0] if hostname != "unknown" else hostname
+
     title = f"{status_emoji} {container_name} — {available_text}"
     body = (
-        f"🖥️ Server: {hostname}\n"
+        f"🖥️ Server: {server_display}\n"
         f"🖼️ Image: {image}\n"
         f"📦 Container: {container_name}"
         f"{deploy_link}"
@@ -315,13 +430,24 @@ async def manual_deploy(uuid: str, secret: str = ""):
         logger.warning(f"Invalid deploy secret")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+    # Resolve UUID (short → full if cached)
+    resolved_uuid = uuid
+    if len(uuid) <= SHORT_UUID_LENGTH:
+        full_uuid = get_uuid_from_cache(uuid)
+        if full_uuid:
+            logger.info(f"Resolved short UUID {uuid} → {full_uuid}")
+            resolved_uuid = full_uuid
+        else:
+            logger.warning(f"Short UUID {uuid} not found in cache, may be expired")
+            raise HTTPException(status_code=404, detail="UUID not found in cache (may be expired)")
+
     coolify_url = os.getenv("COOLIFY_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
     if not coolify_url or not coolify_token:
         raise HTTPException(status_code=500, detail="Coolify not configured")
 
-    deployed = await trigger_coolify(coolify_url, coolify_token, uuid)
+    deployed = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
     return JSONResponse({"ok": True, "deployed": deployed})
 
 
