@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import json
 import logging
@@ -45,6 +46,22 @@ def load_apprise_urls() -> list[str]:
     """
     raw = os.getenv("APPRISE_URLS", "")
     return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def get_cloudflare_headers() -> dict:
+    """
+    Returns a dict with Cloudflare Access headers if both credentials are configured.
+    If either is missing or empty, returns an empty dict (headers are optional).
+    """
+    cf_id = os.getenv("CF_ACCESS_CLIENT_ID", "").strip()
+    cf_secret = os.getenv("CF_ACCESS_CLIENT_SECRET", "").strip()
+
+    if cf_id and cf_secret:
+        return {
+            "CF-Access-Client-Id": cf_id,
+            "CF-Access-Client-Secret": cf_secret
+        }
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -185,13 +202,13 @@ async def diun_webhook(request: Request):
     else:
         logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
-    status_emoji = "🆕" if status == "new" else "⬆�"
+    status_emoji = "🆕" if status == "new" else "⬆�"
     available_text = "new image available" if uuid else "new image (no deploy available)"
 
     title = f"{status_emoji} {container_name} — {available_text}"
     body = (
-        f"🖥� Server: {hostname}\n"
-        f"� Image: {image}\n"
+        f"🖥� Server: {hostname}\n"
+        f"� Image: {image}\n"
         f"📦 Container: {container_name}"
         f"{deploy_link}"
     )
