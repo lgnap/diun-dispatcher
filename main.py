@@ -220,10 +220,25 @@ async def startup_event():
 
 @app.post("/webhook")
 async def diun_webhook(request: Request):
+    # Debug: log request details
+    content_type = request.headers.get('Content-Type', 'not set')
+    content_length = request.headers.get('Content-Length', 'not set')
+    logger.info(f"Webhook received | Content-Type: {content_type} | Content-Length: {content_length}")
+
+    # Try to get raw body first
     try:
-        data = await request.json()
-    except Exception:
+        raw_body = await request.body()
+        logger.info(f"Raw body (first 300 chars): {raw_body[:300]}")
+
+        # Parse JSON manually from raw body
+        data = json.loads(raw_body)
+        logger.info(f"✓ Parsed JSON successfully")
+    except json.JSONDecodeError as e:
+        logger.error(f"✗ Failed to parse JSON from body: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
+    except Exception as e:
+        logger.error(f"✗ Error reading body: {e}")
+        raise HTTPException(status_code=400, detail="Error reading request")
 
     # Optional secret validation
     secret = os.getenv("WEBHOOK_SECRET", "").strip()
