@@ -15,6 +15,47 @@ app = FastAPI(title="Diun Webhook Dispatcher")
 
 
 # ---------------------------------------------------------------------------
+# Log environment configuration on startup
+# ---------------------------------------------------------------------------
+
+def log_environment_config():
+    """Log which environment variables are configured (without exposing secrets)"""
+    logger.info("=== Environment Configuration ===")
+
+    # Check Coolify config
+    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+    logger.info(f"COOLIFY_URL: {'✓ configured' if coolify_url else '✗ not configured'}")
+    logger.info(f"COOLIFY_TOKEN: {'✓ configured' if coolify_token else '✗ not configured'}")
+
+    # Check Cloudflare Access config
+    cf_id = os.getenv("CF_ACCESS_CLIENT_ID", "").strip()
+    cf_secret = os.getenv("CF_ACCESS_CLIENT_SECRET", "").strip()
+    cf_configured = "✓ configured" if (cf_id and cf_secret) else "✗ not configured"
+    logger.info(f"Cloudflare Access headers: {cf_configured}")
+
+    # Check Apprise config
+    apprise_urls = os.getenv("APPRISE_URLS", "").strip()
+    apprise_count = len([u.strip() for u in apprise_urls.split(",") if u.strip()]) if apprise_urls else 0
+    logger.info(f"APPRISE_URLS: {apprise_count} URL(s) configured")
+
+    # Check webhook secret
+    secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    logger.info(f"WEBHOOK_SECRET: {'✓ configured' if secret else '✗ not configured'}")
+
+    # Check dispatcher URL
+    dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
+    logger.info(f"DISPATCHER_URL: {'✓ configured' if dispatcher_url else '✗ not configured'}")
+
+    # Check ignore list
+    ignore_containers_raw = os.getenv("IGNORE_CONTAINERS", "").strip()
+    ignore_count = len([c.strip() for c in ignore_containers_raw.split(",") if c.strip()]) if ignore_containers_raw else 0
+    logger.info(f"IGNORE_CONTAINERS: {ignore_count} container(s) to ignore")
+
+    logger.info("=== End Configuration ===\n")
+
+
+# ---------------------------------------------------------------------------
 # Config from environment variables
 # ---------------------------------------------------------------------------
 
@@ -28,17 +69,26 @@ def get_env(key: str, required: bool = True) -> str:
 async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list[dict]:
     """Fetch all services/applications from Coolify API"""
     url = f"{coolify_url.rstrip('/')}/api/v1/services"
+    cf_headers = get_cloudflare_headers()
     headers = {
         "Authorization": f"Bearer {coolify_token}",
-        **get_cloudflare_headers()
+        **cf_headers
     }
+
+    # Log request details
+    header_names = list(headers.keys())
+    cf_enabled = "CF-Access-Client-Id" in headers
+    logger.info(f"GET {url} | Headers: {header_names} | Cloudflare Access: {'enabled' if cf_enabled else 'disabled'}")
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            logger.info(f"✓ Coolify services fetched: {len(data)} service(s)")
+            return data
     except Exception as e:
-        logger.error(f"Failed to fetch Coolify services: {e}")
+        logger.error(f"✗ Failed to fetch Coolify services: {e}")
         return []
 
 
@@ -119,18 +169,25 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
 
 async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> bool:
     url = f"{coolify_url.rstrip('/')}/api/v1/deploy?uuid={uuid}&force=false"
+    cf_headers = get_cloudflare_headers()
     headers = {
         "Authorization": f"Bearer {coolify_token}",
-        **get_cloudflare_headers()
+        **cf_headers
     }
+
+    # Log request details
+    header_names = list(headers.keys())
+    cf_enabled = "CF-Access-Client-Id" in headers
+    logger.info(f"GET {url} | Headers: {header_names} | Cloudflare Access: {'enabled' if cf_enabled else 'disabled'} | UUID: {uuid}")
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
-            logger.info(f"Coolify deploy triggered uuid={uuid} status={resp.status_code}")
+            logger.info(f"✓ Coolify deploy triggered: uuid={uuid} status={resp.status_code}")
             return True
     except Exception as e:
-        logger.error(f"Coolify deploy failed uuid={uuid}: {e}")
+        logger.error(f"✗ Coolify deploy failed: uuid={uuid} error={e}")
         return False
 
 
@@ -145,6 +202,16 @@ def send_notification(urls: list[str], title: str, body: str) -> None:
         logger.info("Notification sent")
     else:
         logger.error("Notification failed")
+
+
+# ---------------------------------------------------------------------------
+# Startup event
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    """Log configuration on application startup"""
+    log_environment_config()
 
 
 # ---------------------------------------------------------------------------
