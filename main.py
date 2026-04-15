@@ -119,7 +119,10 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
 
 async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> bool:
     url = f"{coolify_url.rstrip('/')}/api/v1/deploy?uuid={uuid}&force=false"
-    headers = {"Authorization": f"Bearer {coolify_token}"}
+    headers = {
+        "Authorization": f"Bearer {coolify_token}",
+        **get_cloudflare_headers()
+    }
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers=headers)
