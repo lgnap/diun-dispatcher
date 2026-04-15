@@ -290,13 +290,13 @@ async def diun_webhook(request: Request):
     else:
         logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
-    status_emoji = "🆕" if status == "new" else "⬆�"
+    status_emoji = "🆕" if status == "new" else "⬆️"
     available_text = "new image available" if uuid else "new image (no deploy available)"
 
     title = f"{status_emoji} {container_name} — {available_text}"
     body = (
-        f"🖥� Server: {hostname}\n"
-        f"� Image: {image}\n"
+        f"🖥️ Server: {hostname}\n"
+        f"🖼️ Image: {image}\n"
         f"📦 Container: {container_name}"
         f"{deploy_link}"
     )
