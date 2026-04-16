@@ -9,11 +9,16 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Diun Webhook Dispatcher")
+
+# Templates
+templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 # UUID cache configuration
 CACHE_FILE = Path(os.getenv("CACHE_FILE", "/data/uuid_cache.json"))
@@ -306,6 +311,67 @@ def send_notification(urls: list[str], title: str, body: str) -> None:
         logger.error("Notification failed")
 
 
+def find_deployment_by_uuid(services: list[dict], uuid: str) -> dict | None:
+    """Find deployment details by service UUID"""
+    for service in services:
+        if service.get("uuid") == uuid:
+            hostname = service.get("server", {}).get("name", "unknown")
+
+            # Try to find any app or database in the service
+            for app in service.get("applications", []):
+                return {
+                    "container_name": app.get("name", "unknown"),
+                    "image": app.get("image", "unknown"),
+                    "hostname": hostname,
+                    "uuid": uuid,
+                    "type": "application"
+                }
+
+            for db in service.get("databases", []):
+                return {
+                    "container_name": db.get("name", "unknown"),
+                    "image": db.get("image", "unknown"),
+                    "hostname": hostname,
+                    "uuid": uuid,
+                    "type": "database"
+                }
+
+    return None
+
+
+def extract_deployments_from_services(services: list[dict]) -> list[dict]:
+    """Extract deployable applications from Coolify services"""
+    deployments = []
+
+    for service in services:
+        hostname = service.get("server", {}).get("name", "unknown")
+        service_uuid = service.get("uuid", "")
+
+        # Extract applications
+        for app in service.get("applications", []):
+            deployment = {
+                "container_name": app.get("name", "unknown"),
+                "image": app.get("image", "unknown"),
+                "hostname": hostname,
+                "uuid": service_uuid,
+                "type": "application"
+            }
+            deployments.append(deployment)
+
+        # Extract databases
+        for db in service.get("databases", []):
+            deployment = {
+                "container_name": db.get("name", "unknown"),
+                "image": db.get("image", "unknown"),
+                "hostname": hostname,
+                "uuid": service_uuid,
+                "type": "database"
+            }
+            deployments.append(deployment)
+
+    return deployments
+
+
 # ---------------------------------------------------------------------------
 # Startup/Shutdown events
 # ---------------------------------------------------------------------------
@@ -326,6 +392,23 @@ async def shutdown_event():
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@app.get("/")
+async def dashboard(request: Request):
+    """Serve deployment dashboard"""
+    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+
+    deployments = []
+    if coolify_url and coolify_token:
+        services = await get_coolify_applications(coolify_url, coolify_token)
+        deployments = extract_deployments_from_services(services)
+
+    return templates.TemplateResponse("index.html", {
+        "request": request,
+        "deployments": deployments
+    })
+
 
 @app.post("/webhook")
 async def diun_webhook(request: Request):
@@ -447,8 +530,68 @@ async def manual_deploy(uuid: str, secret: str = ""):
     if not coolify_url or not coolify_token:
         raise HTTPException(status_code=500, detail="Coolify not configured")
 
+    # Enrich logs with deployment details
+    deployment_info = "unknown service"
+    services = await get_coolify_applications(coolify_url, coolify_token)
+    deployment = find_deployment_by_uuid(services, resolved_uuid)
+    if deployment:
+        deployment_info = f"{deployment['container_name']} ({deployment['type']}) @ {deployment['hostname']}"
+        logger.info(f"🚀 Deploying: {deployment_info} | Image: {deployment['image']}")
+
+    # Trigger deployment
     deployed = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
+
+    if deployed:
+        logger.info(f"✓ Deployment triggered successfully: {deployment_info}")
+    else:
+        logger.warning(f"✗ Deployment failed: {deployment_info}")
+
     return JSONResponse({"ok": True, "deployed": deployed})
+
+
+@app.get("/api/deployments")
+async def get_deployments_api(status: str = None, container: str = None, hostname: str = None):
+    """Get all deployable applications/databases from Coolify services"""
+    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+
+    if not coolify_url or not coolify_token:
+        logger.warning("Coolify not configured, returning empty deployments")
+        return JSONResponse({"deployments": []})
+
+    services = await get_coolify_applications(coolify_url, coolify_token)
+    deployments = extract_deployments_from_services(services)
+
+    # Apply filters
+    if container:
+        deployments = [d for d in deployments if container.lower() in d.get("container_name", "").lower()]
+    if hostname:
+        deployments = [d for d in deployments if d.get("hostname") == hostname]
+
+    return JSONResponse({"deployments": deployments})
+
+
+@app.get("/partials/deployments")
+async def get_deployments_partial(request: Request, container: str = None, hostname: str = None):
+    """Get deployments as HTML partial for HTMX"""
+    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+
+    deployments = []
+    if coolify_url and coolify_token:
+        services = await get_coolify_applications(coolify_url, coolify_token)
+        deployments = extract_deployments_from_services(services)
+
+        # Apply filters
+        if container:
+            deployments = [d for d in deployments if container.lower() in d.get("container_name", "").lower()]
+        if hostname:
+            deployments = [d for d in deployments if d.get("hostname") == hostname]
+
+    return templates.TemplateResponse("deployments_list.html", {
+        "request": request,
+        "deployments": deployments
+    })
 
 
 @app.get("/health")
