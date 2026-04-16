@@ -9,11 +9,16 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Diun Webhook Dispatcher")
+
+# Templates
+templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 # UUID cache configuration
 CACHE_FILE = Path(os.getenv("CACHE_FILE", "/data/uuid_cache.json"))
@@ -24,6 +29,10 @@ SHORT_UUID_LENGTH = 8
 # In-memory cache (loaded from disk at startup)
 _uuid_cache: dict = {}
 _cache_dirty = False
+
+# Recent deployments (in-memory only, no persistence)
+_recent_deployments: list = []
+MAX_RECENT_DEPLOYMENTS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +315,67 @@ def send_notification(urls: list[str], title: str, body: str) -> None:
         logger.error("Notification failed")
 
 
+def find_deployment_by_uuid(services: list[dict], uuid: str) -> dict | None:
+    """Find deployment details by service UUID"""
+    for service in services:
+        if service.get("uuid") == uuid:
+            hostname = service.get("server", {}).get("name", "unknown")
+
+            # Try to find any app or database in the service
+            for app in service.get("applications", []):
+                return {
+                    "container_name": app.get("name", "unknown"),
+                    "image": app.get("image", "unknown"),
+                    "hostname": hostname,
+                    "uuid": uuid,
+                    "type": "application"
+                }
+
+            for db in service.get("databases", []):
+                return {
+                    "container_name": db.get("name", "unknown"),
+                    "image": db.get("image", "unknown"),
+                    "hostname": hostname,
+                    "uuid": uuid,
+                    "type": "database"
+                }
+
+    return None
+
+
+def extract_deployments_from_services(services: list[dict]) -> list[dict]:
+    """Extract deployable applications from Coolify services"""
+    deployments = []
+
+    for service in services:
+        hostname = service.get("server", {}).get("name", "unknown")
+        service_uuid = service.get("uuid", "")
+
+        # Extract applications
+        for app in service.get("applications", []):
+            deployment = {
+                "container_name": app.get("name", "unknown"),
+                "image": app.get("image", "unknown"),
+                "hostname": hostname,
+                "uuid": service_uuid,
+                "type": "application"
+            }
+            deployments.append(deployment)
+
+        # Extract databases
+        for db in service.get("databases", []):
+            deployment = {
+                "container_name": db.get("name", "unknown"),
+                "image": db.get("image", "unknown"),
+                "hostname": hostname,
+                "uuid": service_uuid,
+                "type": "database"
+            }
+            deployments.append(deployment)
+
+    return deployments
+
+
 # ---------------------------------------------------------------------------
 # Startup/Shutdown events
 # ---------------------------------------------------------------------------
@@ -321,6 +391,21 @@ async def startup_event():
 async def shutdown_event():
     """Save cache to disk on application shutdown"""
     _save_cache_to_disk()
+
+
+def log_recent_deployment(container_name: str, image: str, hostname: str) -> None:
+    """Log a deployment to recent deployments history (in-memory only)"""
+    global _recent_deployments
+    from datetime import datetime
+    deployment = {
+        "container_name": container_name,
+        "image": image,
+        "hostname": hostname,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    _recent_deployments.insert(0, deployment)
+    # Keep only recent deployments
+    _recent_deployments[:] = _recent_deployments[:MAX_RECENT_DEPLOYMENTS]
 
 
 # ---------------------------------------------------------------------------
@@ -422,8 +507,8 @@ async def diun_webhook(request: Request):
 
 
 @app.get("/deploy")
-async def manual_deploy(uuid: str, secret: str = ""):
-    """Manually trigger a Coolify deployment"""
+async def manual_deploy(request: Request, uuid: str, secret: str = ""):
+    """Manually trigger a Coolify deployment and show confirmation page"""
     # Validate secret
     expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
     if expected_secret and secret != expected_secret:
@@ -447,8 +532,68 @@ async def manual_deploy(uuid: str, secret: str = ""):
     if not coolify_url or not coolify_token:
         raise HTTPException(status_code=500, detail="Coolify not configured")
 
-    deployed = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
-    return JSONResponse({"ok": True, "deployed": deployed})
+    # Enrich logs with deployment details
+    deployment_info = "unknown service"
+    container_name = "unknown"
+    image = "unknown"
+    hostname = "unknown"
+    deployed = False
+
+    services = await get_coolify_applications(coolify_url, coolify_token)
+    deployment = find_deployment_by_uuid(services, resolved_uuid)
+    if deployment:
+        container_name = deployment['container_name']
+        image = deployment['image']
+        hostname = deployment['hostname']
+        deployment_info = f"{container_name} ({deployment['type']}) @ {hostname}"
+        logger.info(f"🚀 Deploying: {deployment_info} | Image: {image}")
+
+        # Trigger deployment
+        deployed = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
+
+        if deployed:
+            logger.info(f"✓ Deployment triggered successfully: {deployment_info}")
+            log_recent_deployment(container_name, image, hostname)
+        else:
+            logger.warning(f"✗ Deployment failed: {deployment_info}")
+
+    return templates.TemplateResponse("deploy_confirmation.html", {
+        "request": request,
+        "deployed": deployed,
+        "container_name": container_name,
+        "image": image,
+        "hostname": hostname,
+        "uuid": resolved_uuid,
+        "recent_deployments": _recent_deployments
+    })
+
+
+@app.get("/api/deployments")
+async def get_deployments_api(secret: str = "", status: str = None, container: str = None, hostname: str = None):
+    """Get all deployable applications/databases from Coolify services (requires secret)"""
+    # Authenticate
+    expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if not expected_secret or secret != expected_secret:
+        logger.warning("Unauthorized API access to /api/deployments")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+
+    if not coolify_url or not coolify_token:
+        logger.warning("Coolify not configured, returning empty deployments")
+        return JSONResponse({"deployments": []})
+
+    services = await get_coolify_applications(coolify_url, coolify_token)
+    deployments = extract_deployments_from_services(services)
+
+    # Apply filters
+    if container:
+        deployments = [d for d in deployments if container.lower() in d.get("container_name", "").lower()]
+    if hostname:
+        deployments = [d for d in deployments if d.get("hostname") == hostname]
+
+    return JSONResponse({"deployments": deployments})
 
 
 @app.get("/health")
