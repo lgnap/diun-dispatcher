@@ -483,7 +483,8 @@ async def diun_webhook(request: Request):
                 # Use short UUID in the link, cache the mapping
                 uuid_short = uuid[:8]
                 cache_uuid(uuid_short, uuid)
-                deploy_link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}&secret={webhook_secret}"
+                secret_param = f"&secret={webhook_secret}" if webhook_secret else ""
+                deploy_link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}{secret_param}"
     else:
         logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
