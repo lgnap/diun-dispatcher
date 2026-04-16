@@ -30,6 +30,10 @@ SHORT_UUID_LENGTH = 8
 _uuid_cache: dict = {}
 _cache_dirty = False
 
+# Recent deployments (in-memory only, no persistence)
+_recent_deployments: list = []
+MAX_RECENT_DEPLOYMENTS = 5
+
 
 # ---------------------------------------------------------------------------
 # UUID Cache functions (in-memory with lazy disk persistence)
@@ -389,26 +393,24 @@ async def shutdown_event():
     _save_cache_to_disk()
 
 
+def log_recent_deployment(container_name: str, image: str, hostname: str) -> None:
+    """Log a deployment to recent deployments history (in-memory only)"""
+    global _recent_deployments
+    from datetime import datetime
+    deployment = {
+        "container_name": container_name,
+        "image": image,
+        "hostname": hostname,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+    _recent_deployments.insert(0, deployment)
+    # Keep only recent deployments
+    _recent_deployments[:] = _recent_deployments[:MAX_RECENT_DEPLOYMENTS]
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-
-@app.get("/")
-async def dashboard(request: Request):
-    """Serve deployment dashboard"""
-    coolify_url = os.getenv("COOLIFY_URL", "").strip()
-    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
-
-    deployments = []
-    if coolify_url and coolify_token:
-        services = await get_coolify_applications(coolify_url, coolify_token)
-        deployments = extract_deployments_from_services(services)
-
-    return templates.TemplateResponse("index.html", {
-        "request": request,
-        "deployments": deployments
-    })
-
 
 @app.post("/webhook")
 async def diun_webhook(request: Request):
@@ -505,8 +507,8 @@ async def diun_webhook(request: Request):
 
 
 @app.get("/deploy")
-async def manual_deploy(uuid: str, secret: str = ""):
-    """Manually trigger a Coolify deployment"""
+async def manual_deploy(request: Request, uuid: str, secret: str = ""):
+    """Manually trigger a Coolify deployment and show confirmation page"""
     # Validate secret
     expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
     if expected_secret and secret != expected_secret:
@@ -532,26 +534,49 @@ async def manual_deploy(uuid: str, secret: str = ""):
 
     # Enrich logs with deployment details
     deployment_info = "unknown service"
+    container_name = "unknown"
+    image = "unknown"
+    hostname = "unknown"
+    deployed = False
+
     services = await get_coolify_applications(coolify_url, coolify_token)
     deployment = find_deployment_by_uuid(services, resolved_uuid)
     if deployment:
-        deployment_info = f"{deployment['container_name']} ({deployment['type']}) @ {deployment['hostname']}"
-        logger.info(f"🚀 Deploying: {deployment_info} | Image: {deployment['image']}")
+        container_name = deployment['container_name']
+        image = deployment['image']
+        hostname = deployment['hostname']
+        deployment_info = f"{container_name} ({deployment['type']}) @ {hostname}"
+        logger.info(f"🚀 Deploying: {deployment_info} | Image: {image}")
 
-    # Trigger deployment
-    deployed = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
+        # Trigger deployment
+        deployed = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
 
-    if deployed:
-        logger.info(f"✓ Deployment triggered successfully: {deployment_info}")
-    else:
-        logger.warning(f"✗ Deployment failed: {deployment_info}")
+        if deployed:
+            logger.info(f"✓ Deployment triggered successfully: {deployment_info}")
+            log_recent_deployment(container_name, image, hostname)
+        else:
+            logger.warning(f"✗ Deployment failed: {deployment_info}")
 
-    return JSONResponse({"ok": True, "deployed": deployed})
+    return templates.TemplateResponse("deploy_confirmation.html", {
+        "request": request,
+        "deployed": deployed,
+        "container_name": container_name,
+        "image": image,
+        "hostname": hostname,
+        "uuid": resolved_uuid,
+        "recent_deployments": _recent_deployments
+    })
 
 
 @app.get("/api/deployments")
-async def get_deployments_api(status: str = None, container: str = None, hostname: str = None):
-    """Get all deployable applications/databases from Coolify services"""
+async def get_deployments_api(secret: str = "", status: str = None, container: str = None, hostname: str = None):
+    """Get all deployable applications/databases from Coolify services (requires secret)"""
+    # Authenticate
+    expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if not expected_secret or secret != expected_secret:
+        logger.warning("Unauthorized API access to /api/deployments")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     coolify_url = os.getenv("COOLIFY_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
@@ -569,29 +594,6 @@ async def get_deployments_api(status: str = None, container: str = None, hostnam
         deployments = [d for d in deployments if d.get("hostname") == hostname]
 
     return JSONResponse({"deployments": deployments})
-
-
-@app.get("/partials/deployments")
-async def get_deployments_partial(request: Request, container: str = None, hostname: str = None):
-    """Get deployments as HTML partial for HTMX"""
-    coolify_url = os.getenv("COOLIFY_URL", "").strip()
-    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
-
-    deployments = []
-    if coolify_url and coolify_token:
-        services = await get_coolify_applications(coolify_url, coolify_token)
-        deployments = extract_deployments_from_services(services)
-
-        # Apply filters
-        if container:
-            deployments = [d for d in deployments if container.lower() in d.get("container_name", "").lower()]
-        if hostname:
-            deployments = [d for d in deployments if d.get("hostname") == hostname]
-
-    return templates.TemplateResponse("deployments_list.html", {
-        "request": request,
-        "deployments": deployments
-    })
 
 
 @app.get("/health")
