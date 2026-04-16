@@ -485,6 +485,9 @@ async def diun_webhook(request: Request):
                 cache_uuid(uuid_short, uuid)
                 secret_param = f"&secret={webhook_secret}" if webhook_secret else ""
                 deploy_link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}{secret_param}"
+                logger.info(f"Generated deploy link: {deploy_link}")
+            else:
+                logger.warning("DISPATCHER_URL not configured, no deploy link generated")
     else:
         logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
 
