@@ -198,3 +198,79 @@ def test_webhook_ignored_status(mock_notify):
         assert response.status_code == 200
         assert response.json()["action"] == "ignored"
         mock_notify.assert_not_called()
+
+
+# ============================================================================
+# Image normalization / matching (regression: official Docker Hub images)
+# ============================================================================
+
+import pytest
+from main import normalize_image, find_service_uuid_by_image
+
+
+@pytest.mark.parametrize("diun_image,coolify_image", [
+    # Official Docker Hub images: Diun normalizes them with the "library/"
+    # namespace, Coolify stores them bare.
+    ("docker.io/library/nextcloud:34-apache", "nextcloud:34-apache"),
+    ("docker.io/library/redis:7-alpine", "redis:7-alpine"),
+    ("docker.io/library/postgres:17-alpine", "postgres:17-alpine"),
+    ("docker.io/library/eclipse-mosquitto:latest", "eclipse-mosquitto"),
+    ("docker.io/library/busybox:latest", "busybox"),
+    # Namespaced Docker Hub images (already working, guard against regression)
+    ("docker.io/crazymax/diun:latest", "crazymax/diun:latest"),
+    ("docker.io/vikunja/vikunja:latest", "vikunja/vikunja"),
+    ("docker.io/privatebin/nginx-fpm-alpine:latest", "privatebin/nginx-fpm-alpine"),
+    # Explicit registries (already working, guard against regression)
+    ("ghcr.io/mealie-recipes/mealie:v3.21.0", "ghcr.io/mealie-recipes/mealie:v3.21.0"),
+    ("docker.n8n.io/n8nio/n8n:latest", "docker.n8n.io/n8nio/n8n"),
+    ("git.helpcomputer.eu/lgnap/utick-sapiti-filling:latest",
+     "git.helpcomputer.eu/lgnap/utick-sapiti-filling:latest"),
+])
+def test_normalize_image_matches_diun_and_coolify_forms(diun_image, coolify_image):
+    """Diun sends fully normalized refs; Coolify stores compose-style refs."""
+    assert normalize_image(diun_image) == normalize_image(coolify_image)
+
+
+def test_normalize_image_keeps_registry_port():
+    """A registry port must not be mistaken for a tag separator."""
+    assert normalize_image("registry.internal:5000/team/app:1.2") == \
+        "registry.internal:5000/team/app"
+
+
+def test_normalize_image_strips_digest():
+    assert normalize_image("docker.io/library/redis@sha256:abc123") == "redis"
+
+
+def test_normalize_image_does_not_strip_library_from_other_registries():
+    """'library' is only the implicit Docker Hub namespace."""
+    assert normalize_image("ghcr.io/library/thing:1") == "ghcr.io/library/thing"
+
+
+def test_find_service_uuid_matches_official_image_in_databases():
+    """Regression: nextcloud-grawie's postgres was reported as not deployable."""
+    services = [
+        {
+            "uuid": "svc-nextcloud",
+            "server": {"name": "grawie"},
+            "applications": [{"name": "nextcloud", "image": "nextcloud:34-apache"}],
+            "databases": [
+                {"name": "redis", "image": "redis:7-alpine"},
+                {"name": "postgres", "image": "postgres:17-alpine"},
+            ],
+        }
+    ]
+    assert find_service_uuid_by_image(
+        services, "docker.io/library/postgres:17-alpine") == "svc-nextcloud"
+    assert find_service_uuid_by_image(
+        services, "docker.io/library/nextcloud:34-apache") == "svc-nextcloud"
+
+
+def test_find_service_uuid_returns_none_for_unknown_image():
+    services = [
+        {
+            "uuid": "svc-1",
+            "applications": [{"name": "a", "image": "nginx:latest"}],
+            "databases": [],
+        }
+    ]
+    assert find_service_uuid_by_image(services, "docker.io/library/mariadb:11") is None
