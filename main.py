@@ -232,14 +232,41 @@ def get_cloudflare_headers() -> dict:
 # Helpers
 # ---------------------------------------------------------------------------
 
+DOCKER_HUB_REGISTRIES = ("docker.io", "index.docker.io", "registry-1.docker.io")
+DOCKER_HUB_IMPLICIT_NAMESPACE = "library/"
+
+
 def normalize_image(image: str) -> str:
-    """Normalize image name by removing default docker.io registry if present"""
-    # Remove tag
-    base = image.split(":")[0] if ":" in image else image
-    # Remove docker.io prefix (it's implicit when not specified)
-    if base.startswith("docker.io/"):
-        base = base[len("docker.io/"):]
-    return base
+    """Normalize an image reference to a canonical repository name.
+
+    Diun sends fully normalized references (docker.io/library/postgres:17-alpine)
+    while Coolify stores them compose-style (postgres:17-alpine). Both forms must
+    collapse to the same value so they can be compared.
+    """
+    ref = image.strip()
+
+    # Drop a digest, if any (redis@sha256:...)
+    ref = ref.split("@", 1)[0]
+
+    # Split off the registry: the first component is a registry only when it
+    # looks like a host, otherwise it is part of the repository path.
+    head, separator, remainder = ref.partition("/")
+    if separator and ("." in head or ":" in head or head == "localhost"):
+        registry, repository = head, remainder
+    else:
+        registry, repository = "", ref
+
+    # Drop the tag from the repository only — the registry may carry a port
+    if ":" in repository:
+        repository = repository.rsplit(":", 1)[0]
+
+    # docker.io is implicit, and so is its "library/" namespace
+    if registry in DOCKER_HUB_REGISTRIES:
+        registry = ""
+    if not registry and repository.startswith(DOCKER_HUB_IMPLICIT_NAMESPACE):
+        repository = repository[len(DOCKER_HUB_IMPLICIT_NAMESPACE):]
+
+    return f"{registry}/{repository}" if registry else repository
 
 
 def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
