@@ -447,7 +447,8 @@ def log_recent_deployment(container_name: str, image: str, hostname: str) -> Non
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.post("/webhook")
+# Diun sends webhooks with GET by default (JSON in the body); accept both.
+@app.api_route("/webhook", methods=["GET", "POST"])
 async def diun_webhook(request: Request):
     # Debug: log request details
     content_type = request.headers.get('Content-Type', 'not set')
