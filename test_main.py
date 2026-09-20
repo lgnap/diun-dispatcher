@@ -213,7 +213,7 @@ def test_webhook_ignored_status(mock_notify):
 # ============================================================================
 
 import pytest
-from main import normalize_image, find_service_uuid_by_image
+from main import normalize_image, find_service_uuid_by_image, find_service_by_image
 
 
 @pytest.mark.parametrize("diun_image,coolify_image", [
@@ -282,3 +282,83 @@ def test_find_service_uuid_returns_none_for_unknown_image():
         }
     ]
     assert find_service_uuid_by_image(services, "docker.io/library/mariadb:11") is None
+
+
+# ============================================================================
+# Server name comes from Coolify, not from Diun's container-id hostname
+# ============================================================================
+
+
+def test_find_service_by_image_exposes_server_name():
+    services = [
+        {
+            "uuid": "svc-1",
+            "server": {"name": "grawie-prod"},
+            "applications": [{"name": "nextcloud", "image": "nextcloud:34-apache"}],
+            "databases": [],
+        }
+    ]
+    service = find_service_by_image(services, "docker.io/library/nextcloud:34-apache")
+    assert service is not None
+    assert service["uuid"] == "svc-1"
+    assert service["server"]["name"] == "grawie-prod"
+
+
+@patch('main.send_notification')
+@patch('main.get_coolify_applications')
+def test_webhook_uses_coolify_server_name(mock_coolify, mock_notify):
+    """A matched image is labelled with Coolify's server name, not Diun's hostname."""
+    mock_coolify.return_value = [
+        {
+            "uuid": "svc-1",
+            "server": {"name": "grawie-prod"},
+            "applications": [{"name": "nextcloud", "image": "nextcloud:34-apache"}],
+            "databases": [],
+        }
+    ]
+    with patch.dict(os.environ, {
+        "COOLIFY_API_URL": "http://coolify",
+        "COOLIFY_TOKEN": "token",
+    }, clear=True):
+        payload = {
+            "hostname": "b90c71eaee78",  # Diun's default container-id hostname
+            "status": "new",
+            "image": "docker.io/library/nextcloud:34-apache",
+            "metadata": {"ctn_names": "nextcloud-abc"},
+        }
+        resp = client.post("/webhook", json=payload,
+                           headers={"Content-Type": "application/json"})
+        assert resp.status_code == 200
+        body = mock_notify.call_args.args[2]
+        assert "Server: grawie-prod" in body
+        assert "b90c71eaee78" not in body
+
+
+@patch('main.send_notification')
+@patch('main.get_coolify_applications')
+def test_webhook_falls_back_to_diun_hostname_without_match(mock_coolify, mock_notify):
+    """With no Coolify match, keep Diun's reported hostname (domain trimmed)."""
+    mock_coolify.return_value = [
+        {
+            "uuid": "svc-1",
+            "server": {"name": "grawie-prod"},
+            "applications": [{"name": "other", "image": "otherimage:1"}],
+            "databases": [],
+        }
+    ]
+    with patch.dict(os.environ, {
+        "COOLIFY_API_URL": "http://coolify",
+        "COOLIFY_TOKEN": "token",
+    }, clear=True):
+        payload = {
+            "hostname": "diun-host.example.com",
+            "status": "update",
+            "image": "docker.io/library/nginx:latest",
+            "metadata": {"ctn_names": "nginx"},
+        }
+        resp = client.post("/webhook", json=payload,
+                           headers={"Content-Type": "application/json"})
+        assert resp.status_code == 200
+        body = mock_notify.call_args.args[2]
+        assert "Server: diun-host" in body
+        assert "grawie-prod" not in body
