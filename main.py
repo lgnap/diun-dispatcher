@@ -134,9 +134,9 @@ def log_environment_config():
     logger.info("=== Environment Configuration ===")
 
     # Check Coolify config
-    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
-    logger.info(f"COOLIFY_URL: {'✓ configured' if coolify_url else '✗ not configured'}")
+    logger.info(f"COOLIFY_API_URL: {'✓ configured' if coolify_url else '✗ not configured'}")
     logger.info(f"COOLIFY_TOKEN: {'✓ configured' if coolify_token else '✗ not configured'}")
 
     # Check Cloudflare Access config
@@ -495,7 +495,7 @@ async def diun_webhook(request: Request):
 
     apprise_urls = load_apprise_urls()
 
-    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
     uuid = None
@@ -516,7 +516,7 @@ async def diun_webhook(request: Request):
             else:
                 logger.warning("DISPATCHER_URL not configured, no deploy link generated")
     else:
-        logger.warning("COOLIFY_URL or COOLIFY_TOKEN not configured")
+        logger.warning("COOLIFY_API_URL or COOLIFY_TOKEN not configured")
 
     status_emoji = "🆕" if status == "new" else "⬆️"
     available_text = "new image available" if uuid else "new image (no deploy available)"
@@ -557,7 +557,7 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
             logger.warning(f"Short UUID {uuid} not found in cache, may be expired")
             raise HTTPException(status_code=404, detail="UUID not found in cache (may be expired)")
 
-    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
     if not coolify_url or not coolify_token:
@@ -608,7 +608,7 @@ async def get_deployments_api(secret: str = "", status: str = None, container: s
         logger.warning("Unauthorized API access to /api/deployments")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    coolify_url = os.getenv("COOLIFY_URL", "").strip()
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
     if not coolify_url or not coolify_token:

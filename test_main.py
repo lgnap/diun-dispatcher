@@ -93,7 +93,7 @@ def test_deploy_success(mock_trigger, mock_coolify):
 
     with patch.dict(os.environ, {
         "WEBHOOK_SECRET": "test-secret",
-        "COOLIFY_URL": "http://coolify",
+        "COOLIFY_API_URL": "http://coolify",
         "COOLIFY_TOKEN": "token"
     }):
         # Cache the UUID first
@@ -130,7 +130,7 @@ def test_api_deployments_success(mock_coolify):
 
     with patch.dict(os.environ, {
         "WEBHOOK_SECRET": "test-secret",
-        "COOLIFY_URL": "http://coolify",
+        "COOLIFY_API_URL": "http://coolify",
         "COOLIFY_TOKEN": "token"
     }):
         response = client.get("/api/deployments?secret=test-secret")
@@ -159,7 +159,7 @@ def test_api_deployments_filtering(mock_coolify):
 
     with patch.dict(os.environ, {
         "WEBHOOK_SECRET": "test-secret",
-        "COOLIFY_URL": "http://coolify",
+        "COOLIFY_API_URL": "http://coolify",
         "COOLIFY_TOKEN": "token"
     }):
         response = client.get("/api/deployments?secret=test-secret&container=web")

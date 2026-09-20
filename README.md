@@ -30,7 +30,7 @@ Coolify API   Apprise
 docker run -d \
   --name diun-dispatcher \
   -p 8000:8000 \
-  -e COOLIFY_URL="https://coolify.example.com" \
+  -e COOLIFY_API_URL="https://coolify.example.com" \
   -e COOLIFY_TOKEN="your-coolify-api-token" \
   -e APPRISE_URLS="ntfy://ntfy.example.com/topic" \
   -e WEBHOOK_SECRET="your-secret-key" \
@@ -47,7 +47,7 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 
 | Variable        | Description |
 |-----------------|-------------|
-| `COOLIFY_URL`   | Base URL of your Coolify instance (e.g., `https://coolify.example.com`) |
+| `COOLIFY_API_URL` | Base URL of your Coolify instance (e.g., `https://coolify.example.com`). **Not** `COOLIFY_URL` — Coolify reserves the `COOLIFY_*` namespace and would override it with the app's own FQDN. |
 | `COOLIFY_TOKEN` | Coolify API token (generate in Settings → API) |
 
 ### Optional environment variables
@@ -215,7 +215,7 @@ If your Coolify instance is protected by [Cloudflare Access](https://www.cloudfl
 docker run -d \
   --name diun-dispatcher \
   -p 8000:8000 \
-  -e COOLIFY_URL="https://coolify.example.com" \
+  -e COOLIFY_API_URL="https://coolify.example.com" \
   -e COOLIFY_TOKEN="your-token" \
   -e CF_ACCESS_CLIENT_ID="your-client-id" \
   -e CF_ACCESS_CLIENT_SECRET="your-client-secret" \
