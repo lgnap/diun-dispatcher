@@ -272,8 +272,12 @@ def normalize_image(image: str) -> str:
     return f"{registry}/{repository}" if registry else repository
 
 
-def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
-    """Find service UUID by matching Docker image name within applications/databases"""
+def find_service_by_image(services: list[dict], image: str) -> dict | None:
+    """Find the Coolify service whose application/database matches the image.
+
+    Returns the full service dict so callers can read both its uuid and its
+    server name (Coolify knows which server each resource runs on).
+    """
     # Normalize the incoming image
     image_normalized = normalize_image(image)
 
@@ -284,12 +288,9 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
             if not app_image:
                 continue
 
-            app_image_normalized = normalize_image(app_image)
-
-            if app_image_normalized == image_normalized:
-                service_uuid = service.get("uuid")
-                logger.info(f"Found matching service uuid={service_uuid} for image={image}")
-                return service_uuid
+            if normalize_image(app_image) == image_normalized:
+                logger.info(f"Found matching service uuid={service.get('uuid')} for image={image}")
+                return service
 
         # Also check databases within the service
         for db in service.get("databases", []):
@@ -297,15 +298,18 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
             if not db_image:
                 continue
 
-            db_image_normalized = normalize_image(db_image)
-
-            if db_image_normalized == image_normalized:
-                service_uuid = service.get("uuid")
-                logger.info(f"Found matching service uuid={service_uuid} for image={image}")
-                return service_uuid
+            if normalize_image(db_image) == image_normalized:
+                logger.info(f"Found matching service uuid={service.get('uuid')} for image={image}")
+                return service
 
     logger.warning(f"No application found for image={image}")
     return None
+
+
+def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
+    """Find service UUID by matching Docker image name within applications/databases"""
+    service = find_service_by_image(services, image)
+    return service.get("uuid") if service else None
 
 
 async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> bool:
@@ -502,10 +506,12 @@ async def diun_webhook(request: Request):
     coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
 
     uuid = None
+    matched_service = None
     deploy_link = ""
     if coolify_url and coolify_token:
         services = await get_coolify_applications(coolify_url, coolify_token)
-        uuid = find_service_uuid_by_image(services, image)
+        matched_service = find_service_by_image(services, image)
+        uuid = matched_service.get("uuid") if matched_service else None
         if uuid:
             dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
             webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -524,8 +530,13 @@ async def diun_webhook(request: Request):
     status_emoji = "🆕" if status == "new" else "⬆️"
     available_text = "new image available" if uuid else "new image (no deploy available)"
 
-    # Shorten server hostname (keep only the first part before domain)
+    # Prefer the real server name Coolify knows for the matched resource;
+    # fall back to the hostname Diun reported (often just the container id).
     server_display = hostname.split('.')[0] if hostname != "unknown" else hostname
+    if matched_service:
+        coolify_server = matched_service.get("server", {}).get("name")
+        if coolify_server:
+            server_display = coolify_server
 
     title = f"{status_emoji} {container_name} — {available_text}"
     body = (

@@ -91,7 +91,7 @@ In each Diun instance, configure the webhook to point to your dispatcher:
 services:
   diun:
     image: crazymax/diun:latest
-    hostname: production-server      # Used in notifications
+    hostname: production-server      # Fallback server name in notifications
     command: serve
     volumes:
       - "./data:/data"
@@ -109,7 +109,7 @@ services:
 
 ### Key points
 
-- **`hostname`** is displayed in notifications — use a meaningful name (e.g., `production-server`, `staging-app`)
+- **`hostname`** is a *fallback* server name for notifications. When the image matches a Coolify resource, the dispatcher uses the real server name Coolify reports instead; `hostname` is only shown when there is no match (otherwise Diun defaults it to the container id). Still worth setting a meaningful value (e.g., `production-server`).
 - **`X-Diun-Secret`** header must match `WEBHOOK_SECRET` in dispatcher if validation is enabled
 - **`DIUN_WATCH_SCHEDULE`** controls how often Diun checks for new images (cron format)
 
