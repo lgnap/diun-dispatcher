@@ -336,6 +336,19 @@ def test_webhook_uses_coolify_server_name(mock_coolify, mock_notify):
 
 @patch('main.send_notification')
 @patch('main.get_coolify_applications')
+def test_webhook_accepts_get_with_body(mock_coolify, mock_notify):
+    """Diun's default webhook method is GET with a JSON body; it must not 405."""
+    mock_coolify.return_value = []
+    with patch.dict(os.environ, {}, clear=True):
+        payload = {"hostname": "srv", "status": "new", "image": "nextcloud:34-apache"}
+        resp = client.request("GET", "/webhook", content=json.dumps(payload),
+                              headers={"Content-Type": "application/json"})
+        assert resp.status_code == 200
+        mock_notify.assert_called_once()
+
+
+@patch('main.send_notification')
+@patch('main.get_coolify_applications')
 def test_webhook_falls_back_to_diun_hostname_without_match(mock_coolify, mock_notify):
     """With no Coolify match, keep Diun's reported hostname (domain trimmed)."""
     mock_coolify.return_value = [
