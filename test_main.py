@@ -60,6 +60,14 @@ def test_health_endpoint():
     assert response.json() == {"status": "ok"}
 
 
+def test_favicon_endpoint():
+    """Test that /favicon.ico is served (no 404 when opening the page)"""
+    response = client.get("/favicon.ico")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("image/svg+xml")
+    assert b"<svg" in response.content
+
+
 def test_deploy_missing_secret():
     """Test that /deploy rejects request without valid secret"""
     with patch.dict(os.environ, {"WEBHOOK_SECRET": "test-secret"}):

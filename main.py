@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -19,6 +19,9 @@ app = FastAPI(title="Diun Webhook Dispatcher")
 
 # Templates
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
+
+# Static assets
+STATIC_DIR = Path(__file__).parent / "static"
 
 # UUID cache configuration
 CACHE_FILE = Path(os.getenv("CACHE_FILE", "/data/uuid_cache.json"))
@@ -630,3 +633,8 @@ async def get_deployments_api(secret: str = "", status: str = None, container: s
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
