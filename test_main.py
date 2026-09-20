@@ -1,6 +1,6 @@
 import os
 import json
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 from main import app, get_cloudflare_headers
 
@@ -362,3 +362,33 @@ def test_webhook_falls_back_to_diun_hostname_without_match(mock_coolify, mock_no
         body = mock_notify.call_args.args[2]
         assert "Server: diun-host" in body
         assert "grawie-prod" not in body
+
+
+# ============================================================================
+# Coolify deploy trigger must use POST (GET returns 405 Method Not Allowed)
+# ============================================================================
+
+
+@patch("main.httpx.AsyncClient")
+def test_trigger_coolify_uses_post(mock_client_cls):
+    import asyncio
+    from main import trigger_coolify
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+
+    http_client = MagicMock()
+    http_client.post = AsyncMock(return_value=resp)
+    http_client.get = AsyncMock(side_effect=AssertionError("deploy must POST, not GET"))
+
+    cm = mock_client_cls.return_value
+    cm.__aenter__ = AsyncMock(return_value=http_client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+
+    ok = asyncio.run(trigger_coolify("http://coolify", "tok", "svc-1"))
+
+    assert ok is True
+    http_client.post.assert_awaited_once()
+    assert http_client.post.call_args.args[0] == \
+        "http://coolify/api/v1/deploy?uuid=svc-1&force=false"

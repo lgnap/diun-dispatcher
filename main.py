@@ -323,11 +323,12 @@ async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> bo
     # Log request details
     header_names = list(headers.keys())
     cf_enabled = "CF-Access-Client-Id" in headers
-    logger.info(f"GET {url} | Headers: {header_names} | Cloudflare Access: {'enabled' if cf_enabled else 'disabled'} | UUID: {uuid}")
+    logger.info(f"POST {url} | Headers: {header_names} | Cloudflare Access: {'enabled' if cf_enabled else 'disabled'} | UUID: {uuid}")
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, headers=headers)
+            # Coolify's /api/v1/deploy is POST-only; a GET returns 405.
+            resp = await client.post(url, headers=headers)
             resp.raise_for_status()
             logger.info(f"✓ Coolify deploy triggered: uuid={uuid} status={resp.status_code}")
             return True
