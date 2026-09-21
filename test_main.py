@@ -668,7 +668,7 @@ def _watch(statuses, baseline="running:healthy", **kwargs):
         asyncio.run(main.watch_deployment(
             "http://coolify", "tok", "svc-1", baseline,
             container_name="meshmonitor", image="ghcr.io/yeraze/meshmonitor:latest",
-            server="grawie-prod", interval=0, **kwargs))
+            server="grawie-prod", **kwargs))
     return status
 
 
@@ -714,10 +714,30 @@ def test_watch_concludes_anyway_when_the_restart_was_never_observed(mock_notify)
 
 
 def test_watch_polls_often_enough_to_catch_a_short_restart():
-    """A 7 s restart with a ~10 s healthcheck window is invisible at 15 s intervals."""
+    """Measured: the 'starting' window lasts ~6 s. At 5 s we saw it exactly once."""
     import main
-    assert main.WATCH_INTERVAL_SECONDS <= 5
+    assert main.WATCH_FAST_INTERVAL_SECONDS <= 1
     assert main.WATCH_TRANSITION_GRACE_SECONDS <= 60
+
+
+def test_watch_slows_down_once_the_transition_window_is_over():
+    """A stuck service must not be hammered every second for 15 minutes."""
+    from main import watch_interval
+    assert watch_interval(elapsed=0) == 1
+    assert watch_interval(elapsed=59) == 1
+    assert watch_interval(elapsed=60) == 15
+    assert watch_interval(elapsed=600) == 15
+
+
+@patch('main.send_notification')
+def test_watch_logs_only_status_changes(mock_notify, caplog):
+    """At 1 s a poll per line would be 60 identical lines a minute."""
+    import logging
+    with caplog.at_level(logging.INFO, logger="main"):
+        _watch(["running:healthy", "running:healthy", "starting:unhealthy",
+                "starting:unhealthy", "running:healthy"])
+    watching = [r.message for r in caplog.records if r.message.startswith("Watching")]
+    assert len(watching) == 3, watching
 
 
 @patch('main.send_notification')
