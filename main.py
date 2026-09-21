@@ -330,10 +330,11 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
 
 
 def _extract_deployment_uuid(resp) -> str | None:
-    """Read the queued deployment id out of Coolify's deploy response.
+    """Read the queued deployment id out of Coolify's response, if it carries one.
 
-    Coolify answers {"deployments": [{"resource_uuid": ..., "deployment_uuid": ...}]},
-    but a deploy that succeeds with an unexpected body must not count as a failure.
+    The restart endpoint answers with a bare message, so this usually yields None
+    and pending deployments are matched by resource uuid instead. Coolify versions
+    that do answer {"deployments": [{"deployment_uuid": ...}]} give us the better key.
     """
     try:
         payload = resp.json()
@@ -348,7 +349,15 @@ def _extract_deployment_uuid(resp) -> str | None:
 
 
 async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> dict:
-    url = f"{coolify_url.rstrip('/')}/api/v1/deploy?uuid={uuid}&force=false"
+    """Redeploy a Coolify service, pulling the image published under its tag.
+
+    Not /api/v1/deploy: for compose-based services Coolify reuses the image it
+    already has locally, so a deploy would redeploy the very content Diun just
+    told us is outdated. The restart endpoint's latest=true is what the UI calls
+    "pull latest images and restart" — it leaves the compose file untouched, so
+    an ordinary restart still deploys the same content as before.
+    """
+    url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}/restart?latest=true"
     cf_headers = get_cloudflare_headers()
     headers = {
         "Authorization": f"Bearer {coolify_token}",
@@ -358,11 +367,11 @@ async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> di
     # Log request details
     header_names = list(headers.keys())
     cf_enabled = "CF-Access-Client-Id" in headers
-    logger.info(f"POST {url} | Headers: {header_names} | Cloudflare Access: {'enabled' if cf_enabled else 'disabled'} | UUID: {uuid}")
+    logger.info(f"POST {url} | Headers: {header_names} | Cloudflare Access: {'enabled' if cf_enabled else 'disabled'} | UUID: {uuid} | pull latest images: yes")
 
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            # Coolify's /api/v1/deploy is POST-only; a GET returns 405.
+            # Coolify's deploy/restart endpoints are POST-only; a GET returns 405.
             resp = await client.post(url, headers=headers)
             resp.raise_for_status()
             deployment_uuid = _extract_deployment_uuid(resp)
