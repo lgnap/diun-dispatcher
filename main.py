@@ -41,9 +41,12 @@ MAX_RECENT_DEPLOYMENTS = 5
 # Watching a redeploy we triggered: how often to ask Coolify for the resource
 # status, how long to wait for it to come back, and how long to wait for the
 # status to move at all before concluding the restart happened between two polls.
-# Measured on a real service: restarted 7 s after the trigger, healthy ~10 s
-# later — the window where the status differs is about 10 s, hence 5 s polls.
-WATCH_INTERVAL_SECONDS = 5
+# Measured on a real service: restarted 7 s after the trigger, "starting" for
+# ~6 s, then healthy. Polling every second during the grace window gives several
+# samples of that transition; afterwards we only wait for a slow service, and
+# hammering Coolify (which asks Docker on the server) every second would not help.
+WATCH_FAST_INTERVAL_SECONDS = 1
+WATCH_SLOW_INTERVAL_SECONDS = 15
 WATCH_TIMEOUT_SECONDS = 15 * 60
 WATCH_TRANSITION_GRACE_SECONDS = 60
 
@@ -562,10 +565,14 @@ async def get_service_status(coolify_url: str, coolify_token: str, uuid: str) ->
         return None
 
 
+def watch_interval(elapsed: float, grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> float:
+    """Poll fast while the restart can still be observed, slowly afterwards."""
+    return WATCH_FAST_INTERVAL_SECONDS if elapsed < grace else WATCH_SLOW_INTERVAL_SECONDS
+
+
 async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
                            baseline_status: str, container_name: str, image: str,
-                           server: str, interval: float = WATCH_INTERVAL_SECONDS,
-                           timeout: float = WATCH_TIMEOUT_SECONDS,
+                           server: str, timeout: float = WATCH_TIMEOUT_SECONDS,
                            grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> None:
     """Follow a redeploy until the resource is back, then notify.
 
@@ -577,10 +584,13 @@ async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
     started = time.time()
     transition_seen = False
     status = None
+    last_logged = object()  # anything the first status cannot equal
 
     while True:
         status = await get_service_status(coolify_url, coolify_token, uuid)
-        logger.info(f"Watching {container_name} (service {uuid}): status={status}")
+        if status != last_logged:
+            logger.info(f"Watching {container_name} (service {uuid}): status={status}")
+            last_logged = status
 
         if status is not None and status_is_at_least(status, baseline_status):
             if transition_seen:
@@ -611,7 +621,7 @@ async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
             )
             return
 
-        await asyncio.sleep(interval)
+        await asyncio.sleep(watch_interval(time.time() - started, grace))
 
 
 def _notify_deployment_done(container_name: str, image: str, server: str,
