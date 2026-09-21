@@ -15,12 +15,20 @@ Diun (multiple servers)
       ↙         ↘
 Coolify API   Apprise
   (deploy)   (notify)
+      ↓
+POST /coolify-webhook   (deployment finished)
+           ↓
+        Apprise
 ```
 
 1. **Diun** detects a new container image and sends a POST webhook
 2. **diun-dispatcher** queries Coolify API to find the service using that image
 3. **Coolify** redeploys the service with the new image
 4. **Apprise** sends a notification with deployment status and manual deploy link
+
+By default the dispatcher only *notifies*, with a one-click deploy link. Set
+[`AUTO_DEPLOY=true`](#automatic-deployments) and it redeploys by itself, then tells
+you once Coolify reports the deployment as finished.
 
 ## Quick start
 
@@ -54,7 +62,8 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 
 | Variable              | Default | Description |
 |-----------------------|---------|-------------|
-| `WEBHOOK_SECRET`      | (none)  | Shared secret for webhook validation (validates `X-Diun-Secret` header) |
+| `AUTO_DEPLOY`         | `false` | Redeploy matched images automatically instead of only sending a deploy link (`true`/`1`/`yes`/`on`). See [Automatic deployments](#automatic-deployments) |
+| `WEBHOOK_SECRET`      | (none)  | Shared secret for webhook validation (validates `X-Diun-Secret` header, and the `secret` query param of `/coolify-webhook`) |
 | `DISPATCHER_URL`      | (none)  | Your dispatcher URL for manual deploy links in notifications (e.g., `https://dispatcher.example.com`) |
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
@@ -130,6 +139,36 @@ When Diun sends a webhook with a container image (e.g., `ghcr.io/music-assistant
 
 The dispatcher handles these automatically — no manual mapping needed.
 
+## Automatic deployments
+
+With `AUTO_DEPLOY=true`, a Diun event that matches a Coolify service triggers the
+redeploy immediately — no click needed. `IGNORE_CONTAINERS` still wins: an ignored
+container is never deployed automatically.
+
+To be told when the deployment is **finished** (and not merely started), let Coolify
+call back. In Coolify → **Notifications → Webhook**:
+
+1. Set the **Webhook URL** to `https://dispatcher.example.com/coolify-webhook?secret=<WEBHOOK_SECRET>`
+   — Coolify's webhook channel sends no custom headers, so the secret goes in the query string.
+2. Under **Notification events**, enable **Deployment success** and **Deployment failure**
+   (also enable **Resource status changes** if your resources are Coolify *services*:
+   the dispatcher logs every payload it receives, so its logs will tell you which events
+   your instance actually emits).
+3. Click **Enable**.
+
+What you get:
+
+| Situation | Notification |
+|-----------|--------------|
+| Deploy triggered, Coolify reports success | `✅ <container> — deployed`, with a link to the deployment logs |
+| Deploy triggered, Coolify reports failure | `❌ <container> — deployment failed`, with the logs and a manual deploy link |
+| Coolify refused the deploy request | `❌ <container> — auto-deploy could not be triggered`, with a manual deploy link |
+| No callback within 15 minutes | `⏱️ <container> — deployment status unknown`, with a manual deploy link |
+
+A successful auto-deploy sends **one** notification, once it is over. Deployments you
+start by hand in the Coolify UI are ignored by the callback — only deployments the
+dispatcher triggered are reported.
+
 ## API endpoints
 
 ### POST `/webhook`
@@ -175,6 +214,26 @@ Manually trigger a redeployment. Used in notification links.
   "deployed": true
 }
 ```
+
+### POST `/coolify-webhook`
+
+Receives Coolify deployment notifications (see [Automatic deployments](#automatic-deployments)).
+
+**Parameters:**
+- `secret` (query string): Must match `WEBHOOK_SECRET` if set
+
+**Body:** Coolify's notification payload (`event`, `deployment_uuid`, `application_uuid`, `deployment_url`, …)
+
+**Response:**
+```json
+{
+  "ok": true,
+  "deployed": true
+}
+```
+
+An event that matches no deployment triggered by the dispatcher returns
+`{"ok": true, "action": "ignored"}`.
 
 ### GET `/health`
 
