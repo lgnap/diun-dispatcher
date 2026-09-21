@@ -38,10 +38,12 @@ _cache_dirty = False
 _recent_deployments: list = []
 MAX_RECENT_DEPLOYMENTS = 5
 
-# Deployments we triggered ourselves and are still waiting on (in-memory only).
-# Coolify's webhook notification resolves them; the sweeper gives up after a while.
-_pending_deployments: list = []
-PENDING_DEPLOYMENT_TIMEOUT_SECONDS = 15 * 60
+# Watching a redeploy we triggered: how often to ask Coolify for the resource
+# status, how long to wait for it to come back, and how long to wait for the
+# status to move at all before concluding the restart happened between two polls.
+WATCH_INTERVAL_SECONDS = 15
+WATCH_TIMEOUT_SECONDS = 15 * 60
+WATCH_TRANSITION_GRACE_SECONDS = 120
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +334,9 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
 def _extract_deployment_uuid(resp) -> str | None:
     """Read the queued deployment id out of Coolify's response, if it carries one.
 
-    The restart endpoint answers with a bare message, so this usually yields None
-    and pending deployments are matched by resource uuid instead. Coolify versions
-    that do answer {"deployments": [{"deployment_uuid": ...}]} give us the better key.
+    The restart endpoint answers with a bare message, so this usually yields None.
+    It is kept for the Coolify versions that do answer with a deployment id, which
+    the logs then carry.
     """
     try:
         payload = resp.json()
@@ -494,7 +496,6 @@ async def startup_event():
     """Initialize cache and log configuration on application startup"""
     _load_cache_from_disk()
     log_environment_config()
-    asyncio.create_task(_pending_deployment_sweeper())
 
 
 @app.on_event("shutdown")
@@ -519,74 +520,105 @@ def log_recent_deployment(container_name: str, image: str, hostname: str) -> Non
 
 
 # ---------------------------------------------------------------------------
-# Pending deployments (auto-deploy → Coolify callback)
+# Watching a deployment through Coolify's resource status
 # ---------------------------------------------------------------------------
 
-def register_pending_deployment(deployment_uuid: str | None, service_uuid: str,
-                                container_name: str, image: str, server: str) -> None:
-    """Remember a deployment we triggered, so we can report its outcome later."""
-    _pending_deployments.append({
-        "deployment_uuid": deployment_uuid,
-        "service_uuid": service_uuid,
-        "container_name": container_name,
-        "image": image,
-        "server": server,
-        "timestamp": time.time(),
-    })
-    logger.info(
-        f"Waiting for deployment {deployment_uuid or '(no id)'} of {container_name} "
-        f"(service {service_uuid})"
-    )
+def _split_status(status: str) -> tuple[str, str]:
+    """Split Coolify's "running:healthy" into its state and its health."""
+    state, _, health = str(status).partition(":")
+    return state.strip().lower(), health.strip().lower()
 
 
-def pop_pending_deployment(deployment_uuid: str | None = None,
-                           service_uuid: str | None = None) -> dict | None:
-    """Take the pending deployment matching either id, preferring the deployment id.
+def status_is_at_least(current: str, baseline: str) -> bool:
+    """Is the resource back to the state it was in before we redeployed it?
 
-    Coolify reports application deployments with a deployment_uuid; service
-    deployments may only carry the resource uuid, hence the second key.
+    The baseline tells us whether the resource reports health at all: one that
+    was running:healthy has a healthcheck and must be healthy again, while one
+    that was running:unhealthy has none and would never qualify otherwise.
     """
-    for key, value in (("deployment_uuid", deployment_uuid), ("service_uuid", service_uuid)):
-        if not value:
-            continue
-        for entry in _pending_deployments:
-            if entry.get(key) == value:
-                _pending_deployments.remove(entry)
-                return entry
-    return None
+    current_state, current_health = _split_status(current)
+    _, baseline_health = _split_status(baseline)
+
+    if current_state != "running":
+        return False
+    if baseline_health == "healthy":
+        return current_health == "healthy"
+    return True
 
 
-def notify_expired_deployments(now: float = None) -> int:
-    """Report deployments Coolify never reported back on. Returns how many."""
-    if now is None:
-        now = time.time()
-
-    expired = [e for e in _pending_deployments
-               if now - e["timestamp"] >= PENDING_DEPLOYMENT_TIMEOUT_SECONDS]
-    for entry in expired:
-        _pending_deployments.remove(entry)
-        container_name = entry["container_name"]
-        logger.warning(f"No Coolify callback for {container_name} after the timeout")
-        send_notification(
-            load_apprise_urls(),
-            f"⏱️ {container_name} — deployment status unknown",
-            build_notification_body(
-                entry["server"], entry["image"], container_name,
-                "\n\n⚠️ Deploy triggered but Coolify never reported back."
-                + build_deploy_link(entry["service_uuid"]),
-            ),
-        )
-    return len(expired)
+async def get_service_status(coolify_url: str, coolify_token: str, uuid: str) -> str | None:
+    """Read a service's current status ("running:healthy"), or None if unreachable."""
+    url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"
+    headers = {"Authorization": f"Bearer {coolify_token}", **get_cloudflare_headers()}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json().get("status")
+    except Exception as e:
+        logger.warning(f"Could not read status of service {uuid}: {e}")
+        return None
 
 
-async def _pending_deployment_sweeper() -> None:
-    """Check once a minute whether a pending deployment has gone quiet for too long."""
+async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
+                           baseline_status: str, container_name: str, image: str,
+                           server: str, interval: float = WATCH_INTERVAL_SECONDS,
+                           timeout: float = WATCH_TIMEOUT_SECONDS,
+                           grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> None:
+    """Follow a redeploy until the resource is back, then notify.
+
+    Coolify notifies webhooks for deployments, not for the restart we trigger, so
+    the outcome is read from the resource status instead. Success means the status
+    left its baseline and came back to it — with the health the baseline had.
+    """
+    deadline = time.time() + timeout
+    started = time.time()
+    transition_seen = False
+    status = None
+
     while True:
-        await asyncio.sleep(60)
-        try:
-            notify_expired_deployments()
-        except Exception as e:  # a sweeper crash must not take the loop down
-            logger.error(f"Pending deployment sweeper failed: {e}")
+        status = await get_service_status(coolify_url, coolify_token, uuid)
+        logger.info(f"Watching {container_name} (service {uuid}): status={status}")
+
+        if status is not None and status_is_at_least(status, baseline_status):
+            if transition_seen:
+                _notify_deployment_done(container_name, image, server, status, "")
+                return
+            if time.time() - started >= grace:
+                # Coolify refreshes statuses on its own schedule; a restart that
+                # finished between two polls is invisible to us.
+                _notify_deployment_done(
+                    container_name, image, server, status,
+                    "\n\n⚠️ Restart not observed — the status never left its baseline.",
+                )
+                return
+        elif status is not None:
+            transition_seen = True
+
+        if time.time() >= deadline:
+            logger.warning(f"Gave up watching {container_name}: last status={status}")
+            send_notification(
+                load_apprise_urls(),
+                f"⏱️ {container_name} — deployment status unknown",
+                build_notification_body(
+                    server, image, container_name,
+                    f"\n\n⚠️ Redeploy triggered, but the service never came back."
+                    f"\n📊 Last status: {status}" + build_deploy_link(uuid),
+                ),
+            )
+            return
+
+        await asyncio.sleep(interval)
+
+
+def _notify_deployment_done(container_name: str, image: str, server: str,
+                            status: str, extra: str) -> None:
+    send_notification(
+        load_apprise_urls(),
+        f"✅ {container_name} — deployed",
+        build_notification_body(server, image, container_name,
+                                f"\n📊 Status: {status}{extra}"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,14 +712,15 @@ async def diun_webhook(request: Request):
     if uuid and is_auto_deploy_enabled():
         result = await trigger_coolify(coolify_url, coolify_token, uuid)
         if result["ok"]:
-            register_pending_deployment(
-                deployment_uuid=result["deployment_uuid"],
-                service_uuid=uuid,
-                container_name=container_name,
-                image=image,
-                server=server_display,
+            baseline_status = matched_service.get("status", "")
+            logger.info(
+                f"Auto-deploy triggered for {container_name} (service {uuid}), "
+                f"baseline status={baseline_status}"
             )
-            logger.info(f"Auto-deploy triggered for {container_name} (service {uuid})")
+            asyncio.create_task(watch_deployment(
+                coolify_url, coolify_token, uuid, baseline_status,
+                container_name=container_name, image=image, server=server_display,
+            ))
             return JSONResponse({"ok": True, "uuid": uuid, "action": "auto-deploy"})
 
         send_notification(
@@ -793,63 +826,6 @@ async def get_deployments_api(secret: str = "", status: str = None, container: s
         deployments = [d for d in deployments if d.get("hostname") == hostname]
 
     return JSONResponse({"deployments": deployments})
-
-
-@app.post("/coolify-webhook")
-async def coolify_webhook(request: Request, secret: str = ""):
-    """Receive Coolify deployment notifications and report the outcome.
-
-    Configure it in Coolify → Notifications → Webhook with the secret in the
-    query string: Coolify's webhook channel offers no custom headers.
-    """
-    expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
-    if expected_secret and secret != expected_secret:
-        logger.warning("Invalid Coolify webhook secret")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    try:
-        data = json.loads(await request.body())
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        logger.error(f"✗ Failed to parse Coolify webhook body: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    # Logged in full: this is how we learn what Coolify sends for service deployments.
-    logger.info(f"Coolify webhook payload: {json.dumps(data, indent=2)}")
-
-    event = str(data.get("event", ""))
-    deployment_uuid = data.get("deployment_uuid")
-    resource_uuid = data.get("application_uuid") or data.get("resource_uuid")
-
-    pending = pop_pending_deployment(deployment_uuid, resource_uuid)
-    if not pending:
-        logger.info(f"Ignoring Coolify event={event}: no deployment of ours is waiting on it")
-        return JSONResponse({"ok": True, "action": "ignored"})
-
-    success = data.get("success")
-    if not isinstance(success, bool):
-        success = "success" in event
-
-    container_name = pending["container_name"]
-    image = pending["image"]
-
-    if success:
-        title = f"✅ {container_name} — deployed"
-        extra = ""
-        log_recent_deployment(container_name, image, pending["server"])
-    else:
-        title = f"❌ {container_name} — deployment failed"
-        extra = build_deploy_link(pending["service_uuid"])
-
-    deployment_url = data.get("deployment_url")
-    if deployment_url:
-        extra = f"\n\n🔎 Logs: {deployment_url}{extra}"
-
-    send_notification(
-        load_apprise_urls(),
-        title,
-        build_notification_body(pending["server"], image, container_name, extra),
-    )
-    return JSONResponse({"ok": True, "deployed": success})
 
 
 @app.get("/health")
