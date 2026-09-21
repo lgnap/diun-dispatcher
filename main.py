@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import asyncio
 import os
 import json
 import logging
@@ -36,6 +37,11 @@ _cache_dirty = False
 # Recent deployments (in-memory only, no persistence)
 _recent_deployments: list = []
 MAX_RECENT_DEPLOYMENTS = 5
+
+# Deployments we triggered ourselves and are still waiting on (in-memory only).
+# Coolify's webhook notification resolves them; the sweeper gives up after a while.
+_pending_deployments: list = []
+PENDING_DEPLOYMENT_TIMEOUT_SECONDS = 15 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +163,9 @@ def log_environment_config():
     secret = os.getenv("WEBHOOK_SECRET", "").strip()
     logger.info(f"WEBHOOK_SECRET: {'✓ configured' if secret else '✗ not configured'}")
 
+    # Check auto-deploy
+    logger.info(f"AUTO_DEPLOY: {'✓ enabled' if is_auto_deploy_enabled() else '✗ disabled (manual link only)'}")
+
     # Check dispatcher URL
     dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
     logger.info(f"DISPATCHER_URL: {'✓ configured' if dispatcher_url else '✗ not configured'}")
@@ -213,6 +222,14 @@ def load_apprise_urls() -> list[str]:
     """
     raw = os.getenv("APPRISE_URLS", "")
     return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+AUTO_DEPLOY_TRUTHY = ("true", "1", "yes", "on")
+
+
+def is_auto_deploy_enabled() -> bool:
+    """AUTO_DEPLOY makes the dispatcher redeploy matched images by itself."""
+    return os.getenv("AUTO_DEPLOY", "").strip().lower() in AUTO_DEPLOY_TRUTHY
 
 
 def get_cloudflare_headers() -> dict:
@@ -312,7 +329,25 @@ def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
     return service.get("uuid") if service else None
 
 
-async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> bool:
+def _extract_deployment_uuid(resp) -> str | None:
+    """Read the queued deployment id out of Coolify's deploy response.
+
+    Coolify answers {"deployments": [{"resource_uuid": ..., "deployment_uuid": ...}]},
+    but a deploy that succeeds with an unexpected body must not count as a failure.
+    """
+    try:
+        payload = resp.json()
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        deployments = payload.get("deployments") or []
+        if deployments and isinstance(deployments[0], dict):
+            return deployments[0].get("deployment_uuid")
+        return payload.get("deployment_uuid")
+    return None
+
+
+async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> dict:
     url = f"{coolify_url.rstrip('/')}/api/v1/deploy?uuid={uuid}&force=false"
     cf_headers = get_cloudflare_headers()
     headers = {
@@ -330,11 +365,41 @@ async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> bo
             # Coolify's /api/v1/deploy is POST-only; a GET returns 405.
             resp = await client.post(url, headers=headers)
             resp.raise_for_status()
-            logger.info(f"✓ Coolify deploy triggered: uuid={uuid} status={resp.status_code}")
-            return True
+            deployment_uuid = _extract_deployment_uuid(resp)
+            logger.info(
+                f"✓ Coolify deploy triggered: uuid={uuid} status={resp.status_code} "
+                f"deployment_uuid={deployment_uuid}"
+            )
+            return {"ok": True, "deployment_uuid": deployment_uuid}
     except Exception as e:
         logger.error(f"✗ Coolify deploy failed: uuid={uuid} error={e}")
-        return False
+        return {"ok": False, "deployment_uuid": None}
+
+
+def build_deploy_link(uuid: str) -> str:
+    """Build the manual deploy link shown in notifications (empty if not configurable)."""
+    dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
+    if not dispatcher_url:
+        logger.warning("DISPATCHER_URL not configured, no deploy link generated")
+        return ""
+
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    uuid_short = uuid[:SHORT_UUID_LENGTH]
+    cache_uuid(uuid_short, uuid)
+    secret_param = f"&secret={webhook_secret}" if webhook_secret else ""
+    link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}{secret_param}"
+    logger.info(f"Generated deploy link: {link}")
+    return link
+
+
+def build_notification_body(server: str, image: str, container_name: str, extra: str = "") -> str:
+    """The Server/Image/Container block shared by every notification."""
+    return (
+        f"🖥️ Server: {server}\n"
+        f"🖼️ Image: {image}\n"
+        f"📦 Container: {container_name}"
+        f"{extra}"
+    )
 
 
 def send_notification(urls: list[str], title: str, body: str) -> None:
@@ -420,6 +485,7 @@ async def startup_event():
     """Initialize cache and log configuration on application startup"""
     _load_cache_from_disk()
     log_environment_config()
+    asyncio.create_task(_pending_deployment_sweeper())
 
 
 @app.on_event("shutdown")
@@ -441,6 +507,77 @@ def log_recent_deployment(container_name: str, image: str, hostname: str) -> Non
     _recent_deployments.insert(0, deployment)
     # Keep only recent deployments
     _recent_deployments[:] = _recent_deployments[:MAX_RECENT_DEPLOYMENTS]
+
+
+# ---------------------------------------------------------------------------
+# Pending deployments (auto-deploy → Coolify callback)
+# ---------------------------------------------------------------------------
+
+def register_pending_deployment(deployment_uuid: str | None, service_uuid: str,
+                                container_name: str, image: str, server: str) -> None:
+    """Remember a deployment we triggered, so we can report its outcome later."""
+    _pending_deployments.append({
+        "deployment_uuid": deployment_uuid,
+        "service_uuid": service_uuid,
+        "container_name": container_name,
+        "image": image,
+        "server": server,
+        "timestamp": time.time(),
+    })
+    logger.info(
+        f"Waiting for deployment {deployment_uuid or '(no id)'} of {container_name} "
+        f"(service {service_uuid})"
+    )
+
+
+def pop_pending_deployment(deployment_uuid: str | None = None,
+                           service_uuid: str | None = None) -> dict | None:
+    """Take the pending deployment matching either id, preferring the deployment id.
+
+    Coolify reports application deployments with a deployment_uuid; service
+    deployments may only carry the resource uuid, hence the second key.
+    """
+    for key, value in (("deployment_uuid", deployment_uuid), ("service_uuid", service_uuid)):
+        if not value:
+            continue
+        for entry in _pending_deployments:
+            if entry.get(key) == value:
+                _pending_deployments.remove(entry)
+                return entry
+    return None
+
+
+def notify_expired_deployments(now: float = None) -> int:
+    """Report deployments Coolify never reported back on. Returns how many."""
+    if now is None:
+        now = time.time()
+
+    expired = [e for e in _pending_deployments
+               if now - e["timestamp"] >= PENDING_DEPLOYMENT_TIMEOUT_SECONDS]
+    for entry in expired:
+        _pending_deployments.remove(entry)
+        container_name = entry["container_name"]
+        logger.warning(f"No Coolify callback for {container_name} after the timeout")
+        send_notification(
+            load_apprise_urls(),
+            f"⏱️ {container_name} — deployment status unknown",
+            build_notification_body(
+                entry["server"], entry["image"], container_name,
+                "\n\n⚠️ Deploy triggered but Coolify never reported back."
+                + build_deploy_link(entry["service_uuid"]),
+            ),
+        )
+    return len(expired)
+
+
+async def _pending_deployment_sweeper() -> None:
+    """Check once a minute whether a pending deployment has gone quiet for too long."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            notify_expired_deployments()
+        except Exception as e:  # a sweeper crash must not take the loop down
+            logger.error(f"Pending deployment sweeper failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -515,17 +652,7 @@ async def diun_webhook(request: Request):
         matched_service = find_service_by_image(services, image)
         uuid = matched_service.get("uuid") if matched_service else None
         if uuid:
-            dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
-            webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
-            if dispatcher_url:
-                # Use short UUID in the link, cache the mapping
-                uuid_short = uuid[:8]
-                cache_uuid(uuid_short, uuid)
-                secret_param = f"&secret={webhook_secret}" if webhook_secret else ""
-                deploy_link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}{secret_param}"
-                logger.info(f"Generated deploy link: {deploy_link}")
-            else:
-                logger.warning("DISPATCHER_URL not configured, no deploy link generated")
+            deploy_link = build_deploy_link(uuid)
     else:
         logger.warning("COOLIFY_API_URL or COOLIFY_TOKEN not configured")
 
@@ -540,13 +667,29 @@ async def diun_webhook(request: Request):
         if coolify_server:
             server_display = coolify_server
 
+    # AUTO_DEPLOY: redeploy right away and stay silent until Coolify reports back.
+    if uuid and is_auto_deploy_enabled():
+        result = await trigger_coolify(coolify_url, coolify_token, uuid)
+        if result["ok"]:
+            register_pending_deployment(
+                deployment_uuid=result["deployment_uuid"],
+                service_uuid=uuid,
+                container_name=container_name,
+                image=image,
+                server=server_display,
+            )
+            logger.info(f"Auto-deploy triggered for {container_name} (service {uuid})")
+            return JSONResponse({"ok": True, "uuid": uuid, "action": "auto-deploy"})
+
+        send_notification(
+            apprise_urls,
+            f"❌ {container_name} — auto-deploy could not be triggered",
+            build_notification_body(server_display, image, container_name, deploy_link),
+        )
+        return JSONResponse({"ok": True, "uuid": uuid, "action": "auto-deploy-failed"})
+
     title = f"{status_emoji} {container_name} — {available_text}"
-    body = (
-        f"🖥️ Server: {server_display}\n"
-        f"🖼️ Image: {image}\n"
-        f"📦 Container: {container_name}"
-        f"{deploy_link}"
-    )
+    body = build_notification_body(server_display, image, container_name, deploy_link)
 
     send_notification(apprise_urls, title, body)
 
@@ -596,7 +739,7 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
         logger.info(f"🚀 Deploying: {deployment_info} | Image: {image}")
 
         # Trigger deployment
-        deployed = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
+        deployed = (await trigger_coolify(coolify_url, coolify_token, resolved_uuid))["ok"]
 
         if deployed:
             logger.info(f"✓ Deployment triggered successfully: {deployment_info}")
@@ -641,6 +784,63 @@ async def get_deployments_api(secret: str = "", status: str = None, container: s
         deployments = [d for d in deployments if d.get("hostname") == hostname]
 
     return JSONResponse({"deployments": deployments})
+
+
+@app.post("/coolify-webhook")
+async def coolify_webhook(request: Request, secret: str = ""):
+    """Receive Coolify deployment notifications and report the outcome.
+
+    Configure it in Coolify → Notifications → Webhook with the secret in the
+    query string: Coolify's webhook channel offers no custom headers.
+    """
+    expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if expected_secret and secret != expected_secret:
+        logger.warning("Invalid Coolify webhook secret")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        data = json.loads(await request.body())
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        logger.error(f"✗ Failed to parse Coolify webhook body: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Logged in full: this is how we learn what Coolify sends for service deployments.
+    logger.info(f"Coolify webhook payload: {json.dumps(data, indent=2)}")
+
+    event = str(data.get("event", ""))
+    deployment_uuid = data.get("deployment_uuid")
+    resource_uuid = data.get("application_uuid") or data.get("resource_uuid")
+
+    pending = pop_pending_deployment(deployment_uuid, resource_uuid)
+    if not pending:
+        logger.info(f"Ignoring Coolify event={event}: no deployment of ours is waiting on it")
+        return JSONResponse({"ok": True, "action": "ignored"})
+
+    success = data.get("success")
+    if not isinstance(success, bool):
+        success = "success" in event
+
+    container_name = pending["container_name"]
+    image = pending["image"]
+
+    if success:
+        title = f"✅ {container_name} — deployed"
+        extra = ""
+        log_recent_deployment(container_name, image, pending["server"])
+    else:
+        title = f"❌ {container_name} — deployment failed"
+        extra = build_deploy_link(pending["service_uuid"])
+
+    deployment_url = data.get("deployment_url")
+    if deployment_url:
+        extra = f"\n\n🔎 Logs: {deployment_url}{extra}"
+
+    send_notification(
+        load_apprise_urls(),
+        title,
+        build_notification_body(pending["server"], image, container_name, extra),
+    )
+    return JSONResponse({"ok": True, "deployed": success})
 
 
 @app.get("/health")
