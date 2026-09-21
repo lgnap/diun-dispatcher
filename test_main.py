@@ -708,7 +708,16 @@ def test_watch_concludes_anyway_when_the_restart_was_never_observed(mock_notify)
 
     mock_notify.assert_called_once()
     assert "✅" in mock_notify.call_args.args[1]
-    assert "not observed" in mock_notify.call_args.args[2].lower()
+    body = mock_notify.call_args.args[2]
+    assert "too quick" in body.lower()
+    assert "⚠️" not in body, "a quick restart is the normal case, not a warning"
+
+
+def test_watch_polls_often_enough_to_catch_a_short_restart():
+    """A 7 s restart with a ~10 s healthcheck window is invisible at 15 s intervals."""
+    import main
+    assert main.WATCH_INTERVAL_SECONDS <= 5
+    assert main.WATCH_TRANSITION_GRACE_SECONDS <= 60
 
 
 @patch('main.send_notification')
