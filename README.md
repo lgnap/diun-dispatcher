@@ -129,7 +129,7 @@ When Diun sends a webhook with a container image (e.g., `ghcr.io/music-assistant
 1. **dispatcher queries** Coolify API to list all services and databases
 2. **Compares** the image name against all deployed containers
 3. **Finds matching service** by normalized image name
-4. **Triggers redeploy** if found
+4. **Triggers redeploy** if found, pulling the image now published under the tag
 
 ### Image normalization
 
@@ -144,6 +144,11 @@ The dispatcher handles these automatically — no manual mapping needed.
 With `AUTO_DEPLOY=true`, a Diun event that matches a Coolify service triggers the
 redeploy immediately — no click needed. `IGNORE_CONTAINERS` still wins: an ignored
 container is never deployed automatically.
+
+Your compose files are left untouched: nothing is pinned or rewritten, and the image
+pull is requested explicitly for that one deployment. An ordinary restart — from
+Coolify's UI, or because the container came back up on its own — still deploys the
+same content as before, so nothing updates behind your back.
 
 To be told when the deployment is **finished** (and not merely started), let Coolify
 call back. In Coolify → **Notifications → Webhook**:
@@ -202,6 +207,11 @@ Receives Diun webhook events.
 ### GET `/deploy`
 
 Manually trigger a redeployment. Used in notification links.
+
+Deployments go through Coolify's `POST /api/v1/services/{uuid}/restart?latest=true` —
+the API equivalent of *advanced → pull latest images and restart*. `POST /api/v1/deploy`
+is **not** used: for compose-based services Coolify reuses the image it already has
+locally, so it would redeploy exactly the content Diun just reported as outdated.
 
 **Parameters:**
 - `uuid` (string): Service UUID (short form cached, or full UUID)

@@ -404,7 +404,7 @@ def test_trigger_coolify_uses_post(mock_client_cls):
     assert result["ok"] is True
     http_client.post.assert_awaited_once()
     assert http_client.post.call_args.args[0] == \
-        "http://coolify/api/v1/deploy?uuid=svc-1&force=false"
+        "http://coolify/api/v1/services/svc-1/restart?latest=true"
 
 
 # ============================================================================
@@ -766,3 +766,33 @@ def test_an_expired_deployment_is_reported_only_once(mock_notify):
     notify_expired_deployments()
     assert notify_expired_deployments() == 0
     mock_notify.assert_called_once()
+
+
+# ============================================================================
+# Deploying must pull the new image, or the whole feature is pointless
+# ============================================================================
+
+
+@patch("main.httpx.AsyncClient")
+def test_trigger_coolify_asks_coolify_to_pull_the_latest_images(mock_client_cls):
+    """/api/v1/deploy does not repull an image a service already has locally.
+
+    The restart endpoint with latest=true is Coolify's "pull latest images and
+    restart", and it leaves the compose file alone: an ordinary restart still
+    deploys the same content.
+    """
+    import asyncio
+    from main import trigger_coolify
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"message": "Service restaring request queued."}
+    http_client = _mock_httpx_post(mock_client_cls, resp=resp)
+
+    result = asyncio.run(trigger_coolify("http://coolify", "tok", "svc-1"))
+
+    url = http_client.post.call_args.args[0]
+    assert "/api/v1/services/svc-1/restart" in url
+    assert "latest=true" in url
+    assert result == {"ok": True, "deployment_uuid": None}
