@@ -97,7 +97,7 @@ def test_deploy_success(mock_trigger, mock_coolify):
             "databases": []
         }
     ]
-    mock_trigger.return_value = True
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
 
     with patch.dict(os.environ, {
         "WEBHOOK_SECRET": "test-secret",
@@ -399,9 +399,370 @@ def test_trigger_coolify_uses_post(mock_client_cls):
     cm.__aenter__ = AsyncMock(return_value=http_client)
     cm.__aexit__ = AsyncMock(return_value=False)
 
-    ok = asyncio.run(trigger_coolify("http://coolify", "tok", "svc-1"))
+    result = asyncio.run(trigger_coolify("http://coolify", "tok", "svc-1"))
 
-    assert ok is True
+    assert result["ok"] is True
     http_client.post.assert_awaited_once()
     assert http_client.post.call_args.args[0] == \
         "http://coolify/api/v1/deploy?uuid=svc-1&force=false"
+
+
+# ============================================================================
+# AUTO_DEPLOY: the dispatcher redeploys by itself instead of sending a link
+# ============================================================================
+
+
+MATCHING_SERVICE = {
+    "uuid": "svc-1",
+    "server": {"name": "grawie-prod"},
+    "applications": [{"name": "nextcloud", "image": "nextcloud:34-apache"}],
+    "databases": [],
+}
+
+DIUN_PAYLOAD = {
+    "hostname": "diun-host",
+    "status": "new",
+    "image": "docker.io/library/nextcloud:34-apache",
+    "metadata": {"ctn_names": "nextcloud"},
+}
+
+AUTO_DEPLOY_ENV = {
+    "COOLIFY_API_URL": "http://coolify",
+    "COOLIFY_TOKEN": "token",
+    "AUTO_DEPLOY": "true",
+    "DISPATCHER_URL": "http://dispatcher",
+    "WEBHOOK_SECRET": "s3cret",
+}
+
+
+def test_auto_deploy_is_disabled_by_default():
+    from main import is_auto_deploy_enabled
+    with patch.dict(os.environ, {}, clear=True):
+        assert is_auto_deploy_enabled() is False
+
+
+def test_auto_deploy_accepts_common_truthy_values():
+    from main import is_auto_deploy_enabled
+    for value in ("true", "TRUE", "1", "yes", "on"):
+        with patch.dict(os.environ, {"AUTO_DEPLOY": value}, clear=True):
+            assert is_auto_deploy_enabled() is True, value
+
+
+def test_auto_deploy_treats_other_values_as_disabled():
+    from main import is_auto_deploy_enabled
+    for value in ("false", "0", "no", ""):
+        with patch.dict(os.environ, {"AUTO_DEPLOY": value}, clear=True):
+            assert is_auto_deploy_enabled() is False, value
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_webhook_triggers_deploy_when_auto_deploy_enabled(mock_coolify, mock_trigger, mock_notify):
+    """With AUTO_DEPLOY on, a matched image is redeployed without waiting for a click."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.post("/webhook", json=DIUN_PAYLOAD,
+                           headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.status_code == 200
+    assert mock_trigger.call_args.args[2] == "svc-1"
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_webhook_stays_silent_until_deployment_finishes(mock_coolify, mock_trigger, mock_notify):
+    """A successful auto-deploy notifies only once Coolify reports back."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+
+    mock_notify.assert_not_called()
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_webhook_notifies_with_manual_link_when_trigger_fails(mock_coolify, mock_trigger, mock_notify):
+    """If Coolify refuses the deploy, the user is told and gets the manual link."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": False, "deployment_uuid": None}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+
+    mock_notify.assert_called_once()
+    title = mock_notify.call_args.args[1]
+    body = mock_notify.call_args.args[2]
+    assert "nextcloud" in title
+    assert "\u274c" in title, "an auto-deploy that could not be triggered must read as a failure"
+    assert "/deploy?uuid=" in body
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_webhook_keeps_manual_link_when_auto_deploy_disabled(mock_coolify, mock_trigger, mock_notify):
+    """Default behaviour is unchanged: notify with a link, deploy nothing."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+
+    env = {**AUTO_DEPLOY_ENV, "AUTO_DEPLOY": "false"}
+    with patch.dict(os.environ, env, clear=True):
+        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+
+    mock_trigger.assert_not_called()
+    mock_notify.assert_called_once()
+    assert "/deploy?uuid=" in mock_notify.call_args.args[2]
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_ignored_container_is_never_auto_deployed(mock_coolify, mock_trigger, mock_notify):
+    """IGNORE_CONTAINERS wins over AUTO_DEPLOY."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+
+    env = {**AUTO_DEPLOY_ENV, "IGNORE_CONTAINERS": "nextcloud"}
+    with patch.dict(os.environ, env, clear=True):
+        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+
+    mock_trigger.assert_not_called()
+    mock_notify.assert_not_called()
+
+
+def _mock_httpx_post(mock_client_cls, resp=None, error=None):
+    """Wire a mocked httpx.AsyncClient whose post() returns resp or raises error."""
+    http_client = MagicMock()
+    if error is not None:
+        http_client.post = AsyncMock(side_effect=error)
+    else:
+        http_client.post = AsyncMock(return_value=resp)
+    cm = mock_client_cls.return_value
+    cm.__aenter__ = AsyncMock(return_value=http_client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return http_client
+
+
+@patch("main.httpx.AsyncClient")
+def test_trigger_coolify_returns_the_deployment_uuid(mock_client_cls):
+    """Coolify answers with the queued deployment id; we need it to track the result."""
+    import asyncio
+    from main import trigger_coolify
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {
+        "deployments": [{"resource_uuid": "svc-1", "deployment_uuid": "dep-9"}]
+    }
+    _mock_httpx_post(mock_client_cls, resp=resp)
+
+    result = asyncio.run(trigger_coolify("http://coolify", "tok", "svc-1"))
+
+    assert result == {"ok": True, "deployment_uuid": "dep-9"}
+
+
+@patch("main.httpx.AsyncClient")
+def test_trigger_coolify_survives_an_unexpected_response_body(mock_client_cls):
+    """A deploy that succeeds without a parsable body is still a success."""
+    import asyncio
+    from main import trigger_coolify
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    resp.json.side_effect = ValueError("not json")
+    _mock_httpx_post(mock_client_cls, resp=resp)
+
+    result = asyncio.run(trigger_coolify("http://coolify", "tok", "svc-1"))
+
+    assert result == {"ok": True, "deployment_uuid": None}
+
+
+@patch("main.httpx.AsyncClient")
+def test_trigger_coolify_reports_failure(mock_client_cls):
+    import asyncio
+    from main import trigger_coolify
+
+    _mock_httpx_post(mock_client_cls, error=RuntimeError("boom"))
+
+    result = asyncio.run(trigger_coolify("http://coolify", "tok", "svc-1"))
+
+    assert result == {"ok": False, "deployment_uuid": None}
+
+
+# ============================================================================
+# Coolify calls us back when the deployment is over
+# ============================================================================
+
+
+def _clear_pending():
+    import main
+    main._pending_deployments.clear()
+
+
+def _register(deployment_uuid="dep-1", service_uuid="svc-1"):
+    from main import register_pending_deployment
+    _clear_pending()
+    register_pending_deployment(
+        deployment_uuid=deployment_uuid,
+        service_uuid=service_uuid,
+        container_name="nextcloud",
+        image="nextcloud:34-apache",
+        server="grawie-prod",
+    )
+
+
+def test_coolify_webhook_rejects_an_invalid_secret():
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        resp = client.post("/coolify-webhook?secret=wrong", json={"event": "deployment_success"})
+        assert resp.status_code == 401
+
+
+@patch('main.send_notification')
+def test_coolify_webhook_notifies_when_the_deployment_succeeded(mock_notify):
+    _register()
+    payload = {
+        "event": "deployment_success",
+        "success": True,
+        "application_name": "nextcloud",
+        "application_uuid": "svc-1",
+        "deployment_uuid": "dep-1",
+        "deployment_url": "http://coolify/deployment/dep-1",
+    }
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        resp = client.post("/coolify-webhook?secret=s3cret", json=payload)
+
+    assert resp.status_code == 200
+    mock_notify.assert_called_once()
+    title = mock_notify.call_args.args[1]
+    body = mock_notify.call_args.args[2]
+    assert "✅" in title
+    assert "nextcloud" in title
+    assert "grawie-prod" in body
+    assert "http://coolify/deployment/dep-1" in body
+
+
+@patch('main.send_notification')
+def test_coolify_webhook_notifies_when_the_deployment_failed(mock_notify):
+    _register()
+    payload = {
+        "event": "deployment_failed",
+        "success": False,
+        "deployment_uuid": "dep-1",
+        "deployment_url": "http://coolify/deployment/dep-1",
+    }
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        client.post("/coolify-webhook?secret=s3cret", json=payload)
+
+    mock_notify.assert_called_once()
+    assert "❌" in mock_notify.call_args.args[1]
+
+
+@patch('main.send_notification')
+def test_coolify_webhook_ignores_a_deployment_we_did_not_trigger(mock_notify):
+    """Deployments started by hand in Coolify's UI must not notify twice."""
+    _clear_pending()
+    payload = {"event": "deployment_success", "deployment_uuid": "someone-else"}
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        resp = client.post("/coolify-webhook?secret=s3cret", json=payload)
+
+    assert resp.status_code == 200
+    mock_notify.assert_not_called()
+
+
+@patch('main.send_notification')
+def test_coolify_webhook_falls_back_to_the_resource_uuid(mock_notify):
+    """Service deployments may report only the resource uuid, not our deployment id."""
+    _register(deployment_uuid="dep-1", service_uuid="svc-1")
+    payload = {"event": "deployment_success", "application_uuid": "svc-1"}
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        client.post("/coolify-webhook?secret=s3cret", json=payload)
+
+    mock_notify.assert_called_once()
+
+
+@patch('main.send_notification')
+def test_coolify_webhook_notifies_only_once_per_deployment(mock_notify):
+    _register()
+    payload = {"event": "deployment_success", "deployment_uuid": "dep-1"}
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        client.post("/coolify-webhook?secret=s3cret", json=payload)
+        client.post("/coolify-webhook?secret=s3cret", json=payload)
+
+    mock_notify.assert_called_once()
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_auto_deploy_registers_the_deployment_it_started(mock_coolify, mock_trigger, mock_notify):
+    """The Diun webhook and the Coolify callback meet through the pending registry."""
+    _clear_pending()
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-42"}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+
+        payload = {"event": "deployment_success", "deployment_uuid": "dep-42"}
+        client.post("/coolify-webhook?secret=s3cret", json=payload)
+
+    mock_notify.assert_called_once()
+    body = mock_notify.call_args.args[2]
+    assert "nextcloud" in body
+    assert "grawie-prod" in body
+
+
+# ============================================================================
+# Safety net: Coolify never called back
+# ============================================================================
+
+
+@patch('main.send_notification')
+def test_a_deployment_without_news_is_reported_as_unknown(mock_notify):
+    """A pending deployment older than the timeout must not die in silence."""
+    import main
+    from main import notify_expired_deployments
+    _register()
+    main._pending_deployments[0]["timestamp"] -= main.PENDING_DEPLOYMENT_TIMEOUT_SECONDS + 1
+
+    with patch.dict(os.environ, {"DISPATCHER_URL": "http://dispatcher",
+                                 "WEBHOOK_SECRET": "s3cret"}, clear=True):
+        expired = notify_expired_deployments()
+
+    assert expired == 1
+    mock_notify.assert_called_once()
+    assert "⏱️" in mock_notify.call_args.args[1]
+    assert "nextcloud" in mock_notify.call_args.args[1]
+    assert "/deploy?uuid=" in mock_notify.call_args.args[2]
+    assert main._pending_deployments == []
+
+
+@patch('main.send_notification')
+def test_a_deployment_still_within_the_timeout_is_left_alone(mock_notify):
+    import main
+    from main import notify_expired_deployments
+    _register()
+
+    assert notify_expired_deployments() == 0
+    mock_notify.assert_not_called()
+    assert len(main._pending_deployments) == 1
+    _clear_pending()
+
+
+@patch('main.send_notification')
+def test_an_expired_deployment_is_reported_only_once(mock_notify):
+    import main
+    from main import notify_expired_deployments
+    _register()
+    main._pending_deployments[0]["timestamp"] -= main.PENDING_DEPLOYMENT_TIMEOUT_SECONDS + 1
+
+    notify_expired_deployments()
+    assert notify_expired_deployments() == 0
+    mock_notify.assert_called_once()
