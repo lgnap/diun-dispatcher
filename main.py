@@ -41,9 +41,11 @@ MAX_RECENT_DEPLOYMENTS = 5
 # Watching a redeploy we triggered: how often to ask Coolify for the resource
 # status, how long to wait for it to come back, and how long to wait for the
 # status to move at all before concluding the restart happened between two polls.
-WATCH_INTERVAL_SECONDS = 15
+# Measured on a real service: restarted 7 s after the trigger, healthy ~10 s
+# later — the window where the status differs is about 10 s, hence 5 s polls.
+WATCH_INTERVAL_SECONDS = 5
 WATCH_TIMEOUT_SECONDS = 15 * 60
-WATCH_TRANSITION_GRACE_SECONDS = 120
+WATCH_TRANSITION_GRACE_SECONDS = 60
 
 
 # ---------------------------------------------------------------------------
@@ -586,10 +588,11 @@ async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
                 return
             if time.time() - started >= grace:
                 # Coolify refreshes statuses on its own schedule; a restart that
-                # finished between two polls is invisible to us.
+                # finished between two polls is invisible to us. That is the
+                # normal case for a service that comes back in a few seconds.
                 _notify_deployment_done(
                     container_name, image, server, status,
-                    "\n\n⚠️ Restart not observed — the status never left its baseline.",
+                    f" {int(grace)} s after the redeploy (restart too quick to observe)",
                 )
                 return
         elif status is not None:
