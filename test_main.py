@@ -414,6 +414,7 @@ def test_trigger_coolify_uses_post(mock_client_cls):
 
 MATCHING_SERVICE = {
     "uuid": "svc-1",
+    "status": "running:healthy",
     "server": {"name": "grawie-prod"},
     "applications": [{"name": "nextcloud", "image": "nextcloud:34-apache"}],
     "databases": [],
@@ -455,10 +456,11 @@ def test_auto_deploy_treats_other_values_as_disabled():
             assert is_auto_deploy_enabled() is False, value
 
 
+@patch('main.watch_deployment')
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
-def test_webhook_triggers_deploy_when_auto_deploy_enabled(mock_coolify, mock_trigger, mock_notify):
+def test_webhook_triggers_deploy_when_auto_deploy_enabled(mock_coolify, mock_trigger, mock_notify, mock_watch):
     """With AUTO_DEPLOY on, a matched image is redeployed without waiting for a click."""
     mock_coolify.return_value = [MATCHING_SERVICE]
     mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
@@ -471,10 +473,11 @@ def test_webhook_triggers_deploy_when_auto_deploy_enabled(mock_coolify, mock_tri
     assert mock_trigger.call_args.args[2] == "svc-1"
 
 
+@patch('main.watch_deployment')
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
-def test_webhook_stays_silent_until_deployment_finishes(mock_coolify, mock_trigger, mock_notify):
+def test_webhook_stays_silent_until_deployment_finishes(mock_coolify, mock_trigger, mock_notify, mock_watch):
     """A successful auto-deploy notifies only once Coolify reports back."""
     mock_coolify.return_value = [MATCHING_SERVICE]
     mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
@@ -597,178 +600,6 @@ def test_trigger_coolify_reports_failure(mock_client_cls):
 
 
 # ============================================================================
-# Coolify calls us back when the deployment is over
-# ============================================================================
-
-
-def _clear_pending():
-    import main
-    main._pending_deployments.clear()
-
-
-def _register(deployment_uuid="dep-1", service_uuid="svc-1"):
-    from main import register_pending_deployment
-    _clear_pending()
-    register_pending_deployment(
-        deployment_uuid=deployment_uuid,
-        service_uuid=service_uuid,
-        container_name="nextcloud",
-        image="nextcloud:34-apache",
-        server="grawie-prod",
-    )
-
-
-def test_coolify_webhook_rejects_an_invalid_secret():
-    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
-        resp = client.post("/coolify-webhook?secret=wrong", json={"event": "deployment_success"})
-        assert resp.status_code == 401
-
-
-@patch('main.send_notification')
-def test_coolify_webhook_notifies_when_the_deployment_succeeded(mock_notify):
-    _register()
-    payload = {
-        "event": "deployment_success",
-        "success": True,
-        "application_name": "nextcloud",
-        "application_uuid": "svc-1",
-        "deployment_uuid": "dep-1",
-        "deployment_url": "http://coolify/deployment/dep-1",
-    }
-    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
-        resp = client.post("/coolify-webhook?secret=s3cret", json=payload)
-
-    assert resp.status_code == 200
-    mock_notify.assert_called_once()
-    title = mock_notify.call_args.args[1]
-    body = mock_notify.call_args.args[2]
-    assert "✅" in title
-    assert "nextcloud" in title
-    assert "grawie-prod" in body
-    assert "http://coolify/deployment/dep-1" in body
-
-
-@patch('main.send_notification')
-def test_coolify_webhook_notifies_when_the_deployment_failed(mock_notify):
-    _register()
-    payload = {
-        "event": "deployment_failed",
-        "success": False,
-        "deployment_uuid": "dep-1",
-        "deployment_url": "http://coolify/deployment/dep-1",
-    }
-    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
-        client.post("/coolify-webhook?secret=s3cret", json=payload)
-
-    mock_notify.assert_called_once()
-    assert "❌" in mock_notify.call_args.args[1]
-
-
-@patch('main.send_notification')
-def test_coolify_webhook_ignores_a_deployment_we_did_not_trigger(mock_notify):
-    """Deployments started by hand in Coolify's UI must not notify twice."""
-    _clear_pending()
-    payload = {"event": "deployment_success", "deployment_uuid": "someone-else"}
-    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
-        resp = client.post("/coolify-webhook?secret=s3cret", json=payload)
-
-    assert resp.status_code == 200
-    mock_notify.assert_not_called()
-
-
-@patch('main.send_notification')
-def test_coolify_webhook_falls_back_to_the_resource_uuid(mock_notify):
-    """Service deployments may report only the resource uuid, not our deployment id."""
-    _register(deployment_uuid="dep-1", service_uuid="svc-1")
-    payload = {"event": "deployment_success", "application_uuid": "svc-1"}
-    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
-        client.post("/coolify-webhook?secret=s3cret", json=payload)
-
-    mock_notify.assert_called_once()
-
-
-@patch('main.send_notification')
-def test_coolify_webhook_notifies_only_once_per_deployment(mock_notify):
-    _register()
-    payload = {"event": "deployment_success", "deployment_uuid": "dep-1"}
-    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
-        client.post("/coolify-webhook?secret=s3cret", json=payload)
-        client.post("/coolify-webhook?secret=s3cret", json=payload)
-
-    mock_notify.assert_called_once()
-
-
-@patch('main.send_notification')
-@patch('main.trigger_coolify')
-@patch('main.get_coolify_applications')
-def test_auto_deploy_registers_the_deployment_it_started(mock_coolify, mock_trigger, mock_notify):
-    """The Diun webhook and the Coolify callback meet through the pending registry."""
-    _clear_pending()
-    mock_coolify.return_value = [MATCHING_SERVICE]
-    mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-42"}
-
-    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
-        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
-
-        payload = {"event": "deployment_success", "deployment_uuid": "dep-42"}
-        client.post("/coolify-webhook?secret=s3cret", json=payload)
-
-    mock_notify.assert_called_once()
-    body = mock_notify.call_args.args[2]
-    assert "nextcloud" in body
-    assert "grawie-prod" in body
-
-
-# ============================================================================
-# Safety net: Coolify never called back
-# ============================================================================
-
-
-@patch('main.send_notification')
-def test_a_deployment_without_news_is_reported_as_unknown(mock_notify):
-    """A pending deployment older than the timeout must not die in silence."""
-    import main
-    from main import notify_expired_deployments
-    _register()
-    main._pending_deployments[0]["timestamp"] -= main.PENDING_DEPLOYMENT_TIMEOUT_SECONDS + 1
-
-    with patch.dict(os.environ, {"DISPATCHER_URL": "http://dispatcher",
-                                 "WEBHOOK_SECRET": "s3cret"}, clear=True):
-        expired = notify_expired_deployments()
-
-    assert expired == 1
-    mock_notify.assert_called_once()
-    assert "⏱️" in mock_notify.call_args.args[1]
-    assert "nextcloud" in mock_notify.call_args.args[1]
-    assert "/deploy?uuid=" in mock_notify.call_args.args[2]
-    assert main._pending_deployments == []
-
-
-@patch('main.send_notification')
-def test_a_deployment_still_within_the_timeout_is_left_alone(mock_notify):
-    import main
-    from main import notify_expired_deployments
-    _register()
-
-    assert notify_expired_deployments() == 0
-    mock_notify.assert_not_called()
-    assert len(main._pending_deployments) == 1
-    _clear_pending()
-
-
-@patch('main.send_notification')
-def test_an_expired_deployment_is_reported_only_once(mock_notify):
-    import main
-    from main import notify_expired_deployments
-    _register()
-    main._pending_deployments[0]["timestamp"] -= main.PENDING_DEPLOYMENT_TIMEOUT_SECONDS + 1
-
-    notify_expired_deployments()
-    assert notify_expired_deployments() == 0
-    mock_notify.assert_called_once()
-
-
-# ============================================================================
 # Deploying must pull the new image, or the whole feature is pointless
 # ============================================================================
 
@@ -796,3 +627,126 @@ def test_trigger_coolify_asks_coolify_to_pull_the_latest_images(mock_client_cls)
     assert "/api/v1/services/svc-1/restart" in url
     assert "latest=true" in url
     assert result == {"ok": True, "deployment_uuid": None}
+
+
+# ============================================================================
+# Watching a deployment through Coolify's resource status
+# ============================================================================
+
+
+def test_a_running_service_meets_an_unhealthy_baseline():
+    """A resource with no healthcheck reports running:unhealthy forever."""
+    from main import status_is_at_least
+    assert status_is_at_least("running:unhealthy", "running:unhealthy") is True
+    assert status_is_at_least("running:healthy", "running:unhealthy") is True
+
+
+def test_a_healthy_baseline_demands_a_healthy_return():
+    """A resource that reported healthy before must report healthy again."""
+    from main import status_is_at_least
+    assert status_is_at_least("running:unhealthy", "running:healthy") is False
+    assert status_is_at_least("running:healthy", "running:healthy") is True
+
+
+def test_a_service_that_is_not_running_never_qualifies():
+    from main import status_is_at_least
+    for status in ("restarting:unhealthy", "exited:unhealthy", "degraded:unhealthy"):
+        assert status_is_at_least(status, "running:unhealthy") is False, status
+
+
+def test_a_status_without_health_suffix_is_accepted():
+    from main import status_is_at_least
+    assert status_is_at_least("running", "running") is True
+
+
+def _watch(statuses, baseline="running:healthy", **kwargs):
+    """Run watch_deployment against a canned sequence of Coolify statuses."""
+    import asyncio
+    import main
+    with patch('main.get_service_status', new=AsyncMock(side_effect=statuses)) as status, \
+         patch('main.asyncio.sleep', new=AsyncMock()):
+        asyncio.run(main.watch_deployment(
+            "http://coolify", "tok", "svc-1", baseline,
+            container_name="meshmonitor", image="ghcr.io/yeraze/meshmonitor:latest",
+            server="grawie-prod", interval=0, **kwargs))
+    return status
+
+
+@patch('main.send_notification')
+def test_watch_reports_success_once_the_service_is_back(mock_notify):
+    _watch(["restarting:unhealthy", "running:healthy"])
+
+    mock_notify.assert_called_once()
+    title, body = mock_notify.call_args.args[1], mock_notify.call_args.args[2]
+    assert "✅" in title
+    assert "meshmonitor" in title
+    assert "running:healthy" in body
+
+
+@patch('main.send_notification')
+def test_watch_accepts_unhealthy_for_a_service_without_healthcheck(mock_notify):
+    _watch(["restarting:unhealthy", "running:unhealthy"], baseline="running:unhealthy")
+
+    mock_notify.assert_called_once()
+    assert "✅" in mock_notify.call_args.args[1]
+
+
+@patch('main.send_notification')
+def test_watch_keeps_waiting_while_a_healthy_service_is_still_unhealthy(mock_notify):
+    """running:unhealthy is not good enough when the resource has a healthcheck."""
+    status = _watch(["running:unhealthy", "running:unhealthy", "running:healthy"])
+
+    assert status.await_count == 3
+    mock_notify.assert_called_once()
+    assert "✅" in mock_notify.call_args.args[1]
+
+
+@patch('main.send_notification')
+def test_watch_concludes_anyway_when_the_restart_was_never_observed(mock_notify):
+    """Coolify refreshes statuses on its own schedule; a quick restart can be missed."""
+    _watch(["running:healthy"], grace=0)
+
+    mock_notify.assert_called_once()
+    assert "✅" in mock_notify.call_args.args[1]
+    assert "not observed" in mock_notify.call_args.args[2].lower()
+
+
+@patch('main.send_notification')
+def test_watch_gives_up_after_the_timeout(mock_notify):
+    _watch(["restarting:unhealthy"], timeout=0)
+
+    mock_notify.assert_called_once()
+    title, body = mock_notify.call_args.args[1], mock_notify.call_args.args[2]
+    assert "⏱️" in title
+    assert "restarting:unhealthy" in body
+
+
+@patch('main.send_notification')
+def test_watch_survives_an_unreachable_coolify(mock_notify):
+    """A failed status call must not crash the watcher, nor count as success."""
+    _watch([None], timeout=0)
+
+    mock_notify.assert_called_once()
+    assert "⏱️" in mock_notify.call_args.args[1]
+
+
+@patch('main.watch_deployment')
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_auto_deploy_watches_the_service_it_restarted(mock_coolify, mock_trigger,
+                                                      mock_notify, mock_watch):
+    """The baseline status is read from the service listing we already fetched."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+
+    mock_notify.assert_not_called()
+    mock_watch.assert_called_once()
+    args, kwargs = mock_watch.call_args
+    assert args[2] == "svc-1"
+    assert args[3] == "running:healthy"
+    assert kwargs["container_name"] == "nextcloud"
+    assert kwargs["server"] == "grawie-prod"
