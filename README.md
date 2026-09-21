@@ -153,10 +153,11 @@ same content as before, so nothing updates behind your back.
 
 To tell you when the deployment is **finished** — not merely started — the dispatcher
 watches the resource: it notes the service's status before redeploying, then polls
-`GET /api/v1/services/{uuid}` every 5 seconds until the status leaves that baseline
-and comes back to it. A service that restarts in a few seconds may never show a
-different status between two polls; after 60 seconds at its baseline the dispatcher
-concludes the deployment succeeded and says the restart was too quick to observe.
+`GET /api/v1/services/{uuid}` — every second for the first minute, where a restart
+shows up as `starting`, then every 15 seconds — until the status leaves that baseline
+and comes back to it. A service that restarts faster than that may never show a
+different status; after 60 seconds at its baseline the dispatcher concludes the
+deployment succeeded and says the restart was too quick to observe.
 
 The baseline is also how the dispatcher knows what "back" means. A service that
 reported `running:healthy` has a healthcheck, so it must report healthy again; one
