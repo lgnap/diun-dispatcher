@@ -368,15 +368,22 @@ def classify_new_tag(configured_image: str | None, image: str) -> str:
       "in-series"  -- a release inside the series in service (1.27.4 for a
                       resource on 1.27): it arrives by itself as an "update"
       "older"      -- a tag of an earlier series than the one in service
-      "newer"      -- a tag worth telling the user about (or not comparable)
+      "rolling"    -- the resource follows a moving tag (latest, stable,
+                      trixie...): every release reaches it as an "update"
+      "unmanaged"  -- no Coolify resource runs this repository (Coolify's own
+                      database, buildkit...): nothing can be done from here,
+                      and without a reference every tag would look new
+      "newer"      -- a tag worth telling the user about
     """
     if configured_image is None:
-        return "newer"
+        return "unmanaged"
     new_tag, current_tag = image_tag(image), image_tag(configured_image)
     if new_tag == current_tag:
         return "in-service"
     new_key, current_key = version_key(new_tag), version_key(current_tag)
-    if new_key is not None and current_key is not None:
+    if current_key is None:
+        return "rolling"
+    if new_key is not None:
         if len(new_key) > len(current_key) and new_key[:len(current_key)] == current_key:
             return "in-series"
         if new_key <= current_key:
