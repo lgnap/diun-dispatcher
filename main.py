@@ -365,6 +365,8 @@ def classify_new_tag(configured_image: str | None, image: str) -> str:
     is configured with, so a new tag can only be adopted by changing it in
     Coolify. Returns:
       "in-service" -- the tag the resource already runs: nothing to report
+      "in-series"  -- a release inside the series in service (1.27.4 for a
+                      resource on 1.27): it arrives by itself as an "update"
       "older"      -- a tag of an earlier series than the one in service
       "newer"      -- a tag worth telling the user about (or not comparable)
     """
@@ -374,8 +376,11 @@ def classify_new_tag(configured_image: str | None, image: str) -> str:
     if new_tag == current_tag:
         return "in-service"
     new_key, current_key = version_key(new_tag), version_key(current_tag)
-    if new_key is not None and current_key is not None and new_key <= current_key:
-        return "older"
+    if new_key is not None and current_key is not None:
+        if len(new_key) > len(current_key) and new_key[:len(current_key)] == current_key:
+            return "in-series"
+        if new_key <= current_key:
+            return "older"
     return "newer"
 
 
