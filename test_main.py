@@ -322,7 +322,7 @@ def test_webhook_uses_coolify_server_name(mock_coolify, mock_notify):
     }, clear=True):
         payload = {
             "hostname": "b90c71eaee78",  # Diun's default container-id hostname
-            "status": "new",
+            "status": "update",
             "image": "docker.io/library/nextcloud:34-apache",
             "metadata": {"ctn_names": "nextcloud-abc"},
         }
@@ -420,9 +420,10 @@ MATCHING_SERVICE = {
     "databases": [],
 }
 
+# "update": the tag in service was republished -- the only event that deploys.
 DIUN_PAYLOAD = {
     "hostname": "diun-host",
-    "status": "new",
+    "status": "update",
     "image": "docker.io/library/nextcloud:34-apache",
     "metadata": {"ctn_names": "nextcloud"},
 }
@@ -779,3 +780,153 @@ def test_auto_deploy_watches_the_service_it_restarted(mock_coolify, mock_trigger
     assert args[3] == "running:healthy"
     assert kwargs["container_name"] == "nextcloud"
     assert kwargs["server"] == "grawie-prod"
+
+
+# ---------------------------------------------------------------------------
+# "new" events: never a redeploy, a notification only for a newer series
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("image, tag", [
+    ("docker.io/library/nextcloud:34-apache", "34-apache"),
+    ("gitea/gitea", "latest"),
+    ("registry.local:5000/team/app:1.2", "1.2"),
+    ("registry.local:5000/team/app", "latest"),
+    ("redis:7@sha256:abc", "7"),
+])
+def test_image_tag(image, tag):
+    from main import image_tag
+    assert image_tag(image) == tag
+
+
+@pytest.mark.parametrize("tag, key", [
+    ("1.27", (1, 27)),
+    ("v6.10.1", (6, 10, 1)),
+    ("11.8-noble", (11, 8)),
+    ("34-apache", (34,)),
+    ("latest", None),
+    ("alpine", None),
+])
+def test_version_key(tag, key):
+    from main import version_key
+    assert version_key(tag) == key
+
+
+@pytest.mark.parametrize("configured, image, kind", [
+    ("nextcloud:34-apache", "docker.io/library/nextcloud:34-apache", "in-service"),
+    ("nextcloud:34-apache", "docker.io/library/nextcloud:33-apache", "older"),
+    ("nextcloud:34-apache", "docker.io/library/nextcloud:35-apache", "newer"),
+    ("gitea/gitea:1.27", "docker.io/gitea/gitea:1.28", "newer"),
+    ("gitea/gitea:1.27", "docker.io/gitea/gitea:1.9", "older"),
+    ("gitea/gitea:latest", "docker.io/gitea/gitea:1.28", "newer"),
+    ("gitea/gitea", "docker.io/gitea/gitea:latest", "in-service"),
+    (None, "docker.io/library/nextcloud:35-apache", "newer"),
+])
+def test_classify_new_tag(configured, image, kind):
+    from main import classify_new_tag
+    assert classify_new_tag(configured, image) == kind
+
+
+def _new_event(image):
+    return {**DIUN_PAYLOAD, "status": "new", "image": image}
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_new_event_for_the_tag_in_service_does_nothing(mock_coolify, mock_trigger, mock_notify):
+    """A Diun restarted with an empty database reports every image in service as
+    "new": that must neither redeploy nor notify (it used to redeploy them all)."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.post("/webhook", json=_new_event("docker.io/library/nextcloud:34-apache"),
+                           headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.json()["action"] == "new-tag-in-service"
+    mock_trigger.assert_not_called()
+    mock_notify.assert_not_called()
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_new_event_for_an_older_series_is_ignored(mock_coolify, mock_trigger, mock_notify):
+    """watch_repo also lists older tags: they are not news."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.post("/webhook", json=_new_event("docker.io/library/nextcloud:33-apache"),
+                           headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.json()["action"] == "new-tag-older"
+    mock_trigger.assert_not_called()
+    mock_notify.assert_not_called()
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_new_event_for_a_newer_series_notifies_without_deploying(mock_coolify, mock_trigger, mock_notify):
+    """A newer series is announced, never deployed: redeploying would only pull
+    the tag already configured, and a major upgrade is the user's call."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.post("/webhook", json=_new_event("docker.io/library/nextcloud:35-apache"),
+                           headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.json()["action"] == "new-tag-notified"
+    mock_trigger.assert_not_called()
+    mock_notify.assert_called_once()
+    title = mock_notify.call_args.args[1]
+    body = mock_notify.call_args.args[2]
+    assert "35-apache" in title and "running 34-apache" in title
+    assert "/deploy?uuid=" not in body, "a deploy link would redeploy the old tag"
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_new_event_without_matching_resource_is_still_announced(mock_coolify, mock_trigger, mock_notify):
+    mock_coolify.return_value = []
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        client.post("/webhook", json=_new_event("docker.io/library/nextcloud:35-apache"),
+                    headers={"X-Diun-Secret": "s3cret"})
+
+    mock_trigger.assert_not_called()
+    mock_notify.assert_called_once()
+
+
+@patch('main.watch_deployment')
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_update_event_still_auto_deploys(mock_coolify, mock_trigger, mock_notify, mock_watch):
+    """An "update" (the tag in service was republished) keeps deploying by itself."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.json()["action"] == "auto-deploy"
+    mock_trigger.assert_called_once()
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_update_of_another_tag_than_the_one_in_service_does_nothing(mock_coolify, mock_trigger, mock_notify):
+    """With watch_repo, Diun also reports republished tags of other series; they
+    must not restart the resource, which is matched by repository only."""
+    mock_coolify.return_value = [MATCHING_SERVICE]
+
+    for other in ("docker.io/library/nextcloud:33-apache", "docker.io/library/nextcloud:35-apache"):
+        with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+            resp = client.post("/webhook", json={**DIUN_PAYLOAD, "image": other},
+                               headers={"X-Diun-Secret": "s3cret"})
+        assert resp.json()["action"] == "update-other-tag", other
+
+    mock_trigger.assert_not_called()
+    mock_notify.assert_not_called()
