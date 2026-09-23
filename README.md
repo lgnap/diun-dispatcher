@@ -156,6 +156,7 @@ changes that tag. So the two Diun statuses are handled differently:
 | `update` | the tag in service was republished (new digest) | redeploy (`AUTO_DEPLOY`), or notify with a deploy link |
 | `update`, another tag | a republished series other than the one in service (listed by `watch_repo`) | nothing — resources are matched by repository, this would restart them for nothing |
 | `new`, same tag as the resource | Diun recording an image it had not seen (fresh database, new container) | nothing — this used to redeploy every resource at once after a Diun reset |
+| `new`, inside the series in service | a `1.27.4` for a resource pinned on `1.27` | nothing — it arrives by itself as an `update` of `1.27` |
 | `new`, older tag | an earlier series listed by `watch_repo` | nothing |
 | `new`, newer tag | a newer series is out | notify only, **never deploy**: change the tag in Coolify when you are ready |
 
@@ -165,13 +166,15 @@ tag (`gitea/gitea:1.27`, `postgres:18-alpine`, `lycheeorg/lychee:v6`) rather tha
 
 ```
 DIUN_DEFAULTS_WATCHREPO=true
-DIUN_DEFAULTS_INCLUDETAGS=^v?\d+(\.\d+)?$
+DIUN_DEFAULTS_INCLUDETAGS=^v?\d+(\.\d+){0,2}$
 DIUN_DEFAULTS_SORTTAGS=semver
 DIUN_DEFAULTS_MAXTAGS=5
 ```
 
 A republished `1.27` (a patch release) arrives as `update` and is deployed; a `1.28`
-appearing arrives as `new` and is only announced. Tags are compared by their leading
+appearing arrives as `new` and is only announced. Including full versions (`x.y.z`)
+also announces new releases for resources pinned on an exact version (`n8n:2.40.5` →
+`2.40.6`), while releases inside a pinned series (`1.27.4` for `1.27`) stay silent. Tags are compared by their leading
 numbers (`v1.27` → 1.27, `11.8-noble` → 11.8); a tag that does not start with a number
 (`latest`, `alpine`) cannot be ordered and is always announced.
 
