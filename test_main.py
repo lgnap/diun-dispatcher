@@ -340,7 +340,7 @@ def test_webhook_accepts_get_with_body(mock_coolify, mock_notify):
     """Diun's default webhook method is GET with a JSON body; it must not 405."""
     mock_coolify.return_value = []
     with patch.dict(os.environ, {}, clear=True):
-        payload = {"hostname": "srv", "status": "new", "image": "nextcloud:34-apache"}
+        payload = {"hostname": "srv", "status": "update", "image": "nextcloud:34-apache"}
         resp = client.request("GET", "/webhook", content=json.dumps(payload),
                               headers={"Content-Type": "application/json"})
         assert resp.status_code == 200
@@ -823,9 +823,10 @@ def test_version_key(tag, key):
     ("n8nio/n8n:2.40.5", "docker.io/n8nio/n8n:2.41", "newer"),
     ("n8nio/n8n:2.40.5", "docker.io/n8nio/n8n:2.40", "older"),
     ("gitea/gitea:1.27", "docker.io/gitea/gitea:1.9", "older"),
-    ("gitea/gitea:latest", "docker.io/gitea/gitea:1.28", "newer"),
+    ("gitea/gitea:latest", "docker.io/gitea/gitea:1.28", "rolling"),
+    ("mwader/postfix-relay:trixie", "docker.io/mwader/postfix-relay:2.1", "rolling"),
     ("gitea/gitea", "docker.io/gitea/gitea:latest", "in-service"),
-    (None, "docker.io/library/nextcloud:35-apache", "newer"),
+    (None, "docker.io/library/nextcloud:35-apache", "unmanaged"),
 ])
 def test_classify_new_tag(configured, image, kind):
     from main import classify_new_tag
@@ -893,15 +894,18 @@ def test_new_event_for_a_newer_series_notifies_without_deploying(mock_coolify, m
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
-def test_new_event_without_matching_resource_is_still_announced(mock_coolify, mock_trigger, mock_notify):
+def test_new_event_without_matching_resource_is_not_announced(mock_coolify, mock_trigger, mock_notify):
+    """Containers Coolify does not manage (its own database, buildkit) cannot be
+    upgraded from here, and with no tag to compare to, every tag would look new."""
     mock_coolify.return_value = []
 
     with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
-        client.post("/webhook", json=_new_event("docker.io/library/nextcloud:35-apache"),
-                    headers={"X-Diun-Secret": "s3cret"})
+        resp = client.post("/webhook", json=_new_event("docker.io/library/nextcloud:35-apache"),
+                           headers={"X-Diun-Secret": "s3cret"})
 
+    assert resp.json()["action"] == "new-tag-unmanaged"
     mock_trigger.assert_not_called()
-    mock_notify.assert_called_once()
+    mock_notify.assert_not_called()
 
 
 @patch('main.watch_deployment')

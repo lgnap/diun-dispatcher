@@ -158,6 +158,8 @@ changes that tag. So the two Diun statuses are handled differently:
 | `new`, same tag as the resource | Diun recording an image it had not seen (fresh database, new container) | nothing — this used to redeploy every resource at once after a Diun reset |
 | `new`, inside the series in service | a `1.27.4` for a resource pinned on `1.27` | nothing — it arrives by itself as an `update` of `1.27` |
 | `new`, older tag | an earlier series listed by `watch_repo` | nothing |
+| `new`, resource on a moving tag (`latest`, `stable`, `trixie`…) | any release | nothing — it reaches the resource as an `update` of that tag |
+| `new`, no Coolify resource runs the repository | Coolify's own database, buildkit… | nothing — it cannot be upgraded from here, and every tag would look new |
 | `new`, newer tag | a newer series is out | notify only, **never deploy**: change the tag in Coolify when you are ready |
 
 This gives *patches automatically, majors on request*: pin each resource to a series
