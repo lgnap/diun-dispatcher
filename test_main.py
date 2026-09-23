@@ -816,6 +816,12 @@ def test_version_key(tag, key):
     ("nextcloud:34-apache", "docker.io/library/nextcloud:33-apache", "older"),
     ("nextcloud:34-apache", "docker.io/library/nextcloud:35-apache", "newer"),
     ("gitea/gitea:1.27", "docker.io/gitea/gitea:1.28", "newer"),
+    ("gitea/gitea:1.27", "docker.io/gitea/gitea:1.27.4", "in-series"),
+    ("crazymax/diun:4", "docker.io/crazymax/diun:4.34.0", "in-series"),
+    ("postgres:18-alpine", "docker.io/library/postgres:18.7", "in-series"),
+    ("n8nio/n8n:2.40.5", "docker.io/n8nio/n8n:2.40.6", "newer"),
+    ("n8nio/n8n:2.40.5", "docker.io/n8nio/n8n:2.41", "newer"),
+    ("n8nio/n8n:2.40.5", "docker.io/n8nio/n8n:2.40", "older"),
     ("gitea/gitea:1.27", "docker.io/gitea/gitea:1.9", "older"),
     ("gitea/gitea:latest", "docker.io/gitea/gitea:1.28", "newer"),
     ("gitea/gitea", "docker.io/gitea/gitea:latest", "in-service"),
@@ -928,5 +934,23 @@ def test_update_of_another_tag_than_the_one_in_service_does_nothing(mock_coolify
                                headers={"X-Diun-Secret": "s3cret"})
         assert resp.json()["action"] == "update-other-tag", other
 
+    mock_trigger.assert_not_called()
+    mock_notify.assert_not_called()
+
+
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_new_release_inside_the_series_in_service_is_not_announced(mock_coolify, mock_trigger, mock_notify):
+    """A 1.27.4 for a resource pinned on 1.27 reaches it as an "update" of 1.27:
+    announcing it as a new version would only be noise."""
+    mock_coolify.return_value = [{**MATCHING_SERVICE, "applications": [
+        {"name": "gitea", "image": "gitea/gitea:1.27"}]}]
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.post("/webhook", json=_new_event("docker.io/gitea/gitea:1.27.4"),
+                           headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.json()["action"] == "new-tag-in-series"
     mock_trigger.assert_not_called()
     mock_notify.assert_not_called()
