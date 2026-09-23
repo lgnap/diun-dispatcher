@@ -142,9 +142,38 @@ The dispatcher handles these automatically — no manual mapping needed.
 
 ## Automatic deployments
 
-With `AUTO_DEPLOY=true`, a Diun event that matches a Coolify service triggers the
-redeploy immediately — no click needed. `IGNORE_CONTAINERS` still wins: an ignored
-container is never deployed automatically.
+With `AUTO_DEPLOY=true`, a Diun **`update`** event that matches a Coolify service
+triggers the redeploy immediately — no click needed. `IGNORE_CONTAINERS` still wins: an
+ignored container is never deployed automatically.
+
+### `update` deploys, `new` only informs
+
+A redeploy always pulls the tag the Coolify resource is **configured** with; it never
+changes that tag. So the two Diun statuses are handled differently:
+
+| Diun status | Meaning | What the dispatcher does |
+|---|---|---|
+| `update` | the tag in service was republished (new digest) | redeploy (`AUTO_DEPLOY`), or notify with a deploy link |
+| `update`, another tag | a republished series other than the one in service (listed by `watch_repo`) | nothing — resources are matched by repository, this would restart them for nothing |
+| `new`, same tag as the resource | Diun recording an image it had not seen (fresh database, new container) | nothing — this used to redeploy every resource at once after a Diun reset |
+| `new`, older tag | an earlier series listed by `watch_repo` | nothing |
+| `new`, newer tag | a newer series is out | notify only, **never deploy**: change the tag in Coolify when you are ready |
+
+This gives *patches automatically, majors on request*: pin each resource to a series
+tag (`gitea/gitea:1.27`, `postgres:18-alpine`, `lycheeorg/lychee:v6`) rather than
+`latest`, and let Diun also list the repository's series tags:
+
+```
+DIUN_DEFAULTS_WATCHREPO=true
+DIUN_DEFAULTS_INCLUDETAGS=^v?\d+(\.\d+)?$
+DIUN_DEFAULTS_SORTTAGS=semver
+DIUN_DEFAULTS_MAXTAGS=5
+```
+
+A republished `1.27` (a patch release) arrives as `update` and is deployed; a `1.28`
+appearing arrives as `new` and is only announced. Tags are compared by their leading
+numbers (`v1.27` → 1.27, `11.8-noble` → 11.8); a tag that does not start with a number
+(`latest`, `alpine`) cannot be ordered and is always announced.
 
 Your compose files are left untouched: nothing is pinned or rewritten, and the image
 pull is requested explicitly for that one deployment. An ordinary restart — from

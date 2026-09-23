@@ -3,6 +3,7 @@ import asyncio
 import os
 import json
 import logging
+import re
 import apprise
 import httpx
 import time
@@ -328,6 +329,54 @@ def find_service_by_image(services: list[dict], image: str) -> dict | None:
 
     logger.warning(f"No application found for image={image}")
     return None
+
+
+def image_tag(image: str) -> str:
+    """The tag of an image reference ("latest" when none is given)."""
+    ref = image.strip().split("@", 1)[0]
+    last = ref.rsplit("/", 1)[-1]
+    return last.rsplit(":", 1)[1] if ":" in last else "latest"
+
+
+def version_key(tag: str) -> tuple[int, ...] | None:
+    """The leading version numbers of a tag, for ordering: "v1.27" -> (1, 27),
+    "11.8-noble" -> (11, 8). None when the tag does not start with a number
+    ("latest", "alpine"), so it cannot be ordered."""
+    match = re.match(r"v?(\d+(?:\.\d+)*)", tag.strip())
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
+
+
+def find_configured_image(service: dict, image: str) -> str | None:
+    """The image reference (with its tag) the matched Coolify resource runs."""
+    image_normalized = normalize_image(image)
+    for resource in service.get("applications", []) + service.get("databases", []):
+        configured = resource.get("image", "")
+        if configured and normalize_image(configured) == image_normalized:
+            return configured
+    return None
+
+
+def classify_new_tag(configured_image: str | None, image: str) -> str:
+    """What a Diun "new" event means for the resource that runs this repository.
+
+    Diun sends "new" both when it discovers a tag it had never seen (watch_repo)
+    and when it first records the image already in service (a fresh database, a
+    new container). Neither must redeploy: redeploying pulls the tag the resource
+    is configured with, so a new tag can only be adopted by changing it in
+    Coolify. Returns:
+      "in-service" -- the tag the resource already runs: nothing to report
+      "older"      -- a tag of an earlier series than the one in service
+      "newer"      -- a tag worth telling the user about (or not comparable)
+    """
+    if configured_image is None:
+        return "newer"
+    new_tag, current_tag = image_tag(image), image_tag(configured_image)
+    if new_tag == current_tag:
+        return "in-service"
+    new_key, current_key = version_key(new_tag), version_key(current_tag)
+    if new_key is not None and current_key is not None and new_key <= current_key:
+        return "older"
+    return "newer"
 
 
 def find_service_uuid_by_image(services: list[dict], image: str) -> str | None:
@@ -721,7 +770,38 @@ async def diun_webhook(request: Request):
         if coolify_server:
             server_display = coolify_server
 
-    # AUTO_DEPLOY: redeploy right away and stay silent until Coolify reports back.
+    # "new": never a redeploy (see classify_new_tag). Only a tag newer than the
+    # one in service is worth a notification; the user adopts it by changing the
+    # tag in Coolify. Before this, a "new" event redeployed like an "update": a
+    # Diun restarted with an empty database redeployed every resource at once.
+    configured = find_configured_image(matched_service, image) if matched_service else None
+    if status == "new":
+        kind = classify_new_tag(configured, image)
+        if kind != "newer":
+            logger.info(f"New tag {image} is {kind} for {container_name} "
+                        f"(configured: {configured}), nothing to do")
+            return JSONResponse({"ok": True, "uuid": uuid, "action": f"new-tag-{kind}"})
+        running = f" (running {image_tag(configured)})" if configured else ""
+        send_notification(
+            apprise_urls,
+            f"{status_emoji} {container_name} — new version available: {image_tag(image)}{running}",
+            build_notification_body(
+                server_display, image, container_name,
+                "\n\nℹ️ Pas de déploiement automatique : changer l'étiquette dans Coolify pour monter de version."),
+        )
+        return JSONResponse({"ok": True, "uuid": uuid, "action": "new-tag-notified"})
+
+    # "update" for another tag than the one in service: with watch_repo, Diun
+    # also follows the other series it listed, and reports them when they are
+    # republished. Resources are matched by repository, so without this check a
+    # republished 1.26 or 1.28 would restart the resource running 1.27 for nothing.
+    if configured and image_tag(configured) != image_tag(image):
+        logger.info(f"Update of {image} is not the tag in service for {container_name} "
+                    f"(configured: {configured}), nothing to do")
+        return JSONResponse({"ok": True, "uuid": uuid, "action": "update-other-tag"})
+
+    # AUTO_DEPLOY ("update" of the tag in service): redeploy right away and stay
+    # silent until Coolify reports back.
     if uuid and is_auto_deploy_enabled():
         result = await trigger_coolify(coolify_url, coolify_token, uuid)
         if result["ok"]:
