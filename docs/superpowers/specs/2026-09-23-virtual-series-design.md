@@ -27,6 +27,7 @@ Coolify holds:
 |---|---|---|
 | `diun-dispatcher.follow=patch` | same major and same minor | → `v6.10.4`, never `v6.11.0` |
 | `diun-dispatcher.follow=minor` | same major | → `v6.11.0`, never `v7.0.0` |
+| `diun-dispatcher.follow=announce` | same major, never applied | "v6.10.1 → v6.11.0 available" (added 2026-09-24) |
 | (none) | nothing | current behaviour: announce only |
 
 For a resource carrying a policy, the dispatcher:

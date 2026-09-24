@@ -231,6 +231,7 @@ within a limit:
 |---|---|---|
 | `diun-dispatcher.follow=patch` | same major and minor | → `v6.10.4`, never `v6.11.0` |
 | `diun-dispatcher.follow=minor` | same major | → `v6.11.0`, never `v7.0.0` |
+| `diun-dispatcher.follow=announce` | same major, **announced, never applied** | `🆕 lychee v6.10.1 → v6.11.0 available`, with an apply link |
 | (none) | nothing | current behaviour: announce only |
 
 ```yaml
@@ -255,6 +256,13 @@ Once a day (`SERIES_CHECK_HOUR`), for each labelled service, the dispatcher:
 4. notifies `✅ lychee v6.10.1 → v6.10.4 applied`, or `❌ … failed` — in which case
    the original compose is put back (and restarted, if the new version had already
    been deployed).
+
+`announce` is for a resource you want to hear about without handing over its
+upgrades, whatever `AUTO_DEPLOY` says. Diun alone cannot do it: with
+`diun.max_tags=1` it only reports the highest tag of the repository, so once a v7
+is out, the patches of the v6 in service are never announced. Each new tag is
+announced once (per dispatcher run); the link in the notification applies it
+exactly as a `minor` policy would.
 
 A Diun `new` event for a tag within the policy triggers that check right away
 instead of the usual announcement; a tag beyond the policy (a new major) is
