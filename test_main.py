@@ -1168,8 +1168,7 @@ def test_list_registry_tags_returns_none_on_failure(mock_client_cls):
 
 SERIES_ENV = {
     "COOLIFY_API_URL": "http://coolify",
-    "COOLIFY_TOKEN": "deploy-token",
-    "COOLIFY_WRITE_TOKEN": "write-token",
+    "COOLIFY_TOKEN": "coolify-token",
     "AUTO_DEPLOY": "true",
     "DISPATCHER_URL": "http://dispatcher",
     "WEBHOOK_SECRET": "s3cret",
@@ -1217,8 +1216,8 @@ def test_upgrade_rewrites_the_compose_then_restarts_and_reports():
     assert outcome == "applied"
     m["patch_compose"].assert_awaited_once()
     args = m["patch_compose"].await_args.args
-    assert args[1] == "write-token" and args[2] == "lychee-svc-uuid" and args[3] == new_raw
-    assert m["trigger_coolify"].await_args.args[1] == "deploy-token"
+    assert args[1] == "coolify-token" and args[2] == "lychee-svc-uuid" and args[3] == new_raw
+    assert m["trigger_coolify"].await_args.args[1] == "coolify-token"
     title = m["send_notification"].call_args.args[1]
     assert "✅" in title and "v6.10.1 → v6.10.4" in title
 
@@ -1318,7 +1317,7 @@ def test_series_check_only_looks_at_labelled_resources():
     plain = {**LYCHEE_SERVICE, "uuid": "plain", "docker_compose_raw": "services:\n  app:\n    image: nginx:1.27\n"}
     listing, registry, upgrade, notify = _run_check([LYCHEE_SERVICE, plain])
 
-    assert listing.await_args.args[1] == "write-token"
+    assert listing.await_args.args[1] == "coolify-token"
     assert [c.args[0] for c in registry.await_args_list] == ["lycheeorg/lychee:v6.10.1", "redis:7"]
     upgrade.assert_awaited_once()
     assert upgrade.await_args.args[1:] == ("lychee", "v6.10.4")

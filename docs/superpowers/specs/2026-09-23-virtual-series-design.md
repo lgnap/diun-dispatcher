@@ -65,8 +65,11 @@ Safeguards:
 
 The current token (`COOLIFY_TOKEN`) is limited to deployments (a call to
 `/api/v1/servers` returns 403, noted in MigrateGrawie). Rewriting a compose
-requires write access: either a second dedicated token (`COOLIFY_WRITE_TOKEN`),
-used only for this PATCH, or widening the current token. The PATCH returns the
+requires write access. **Decided 2026-09-24: widen the current token** rather
+than add a second one, which would live in the same container and protect
+nothing. Coolify permissions do not imply one another (`write` does not grant
+`deploy`): `COOLIFY_TOKEN` needs `read`, `deploy`, `read:sensitive` and `write`.
+The PATCH returns the
 resource's variables **in clear**: never log its response.
 Pitfalls already hit with this API (boum, 2026-09-23): Coolify adds quotes
 around `image:` when saving (compare without quotes); a restart regenerates the
