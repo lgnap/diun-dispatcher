@@ -191,7 +191,9 @@ To tell you when the deployment is **finished** — not merely started — the d
 watches the resource: it notes the service's status before redeploying, then polls
 `GET /api/v1/services/{uuid}` — every second for the first minute, where a restart
 shows up as `starting`, then every 15 seconds — until the status leaves that baseline
-and comes back to it. A service that restarts faster than that may never show a
+and comes back to it **for 30 seconds in a row**. Coolify can report
+`running:healthy` while the new container is still starting, and a version that
+crashes a few seconds later must not count as deployed. A service that restarts faster than that may never show a
 different status; after 60 seconds at its baseline the dispatcher concludes the
 deployment succeeded and says the restart was too quick to observe.
 

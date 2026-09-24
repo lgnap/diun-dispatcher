@@ -662,15 +662,27 @@ def test_a_status_without_health_suffix_is_accepted():
 
 
 def _watch(statuses, baseline="running:healthy", **kwargs):
-    """Run watch_deployment against a canned sequence of Coolify statuses."""
+    """Run watch_deployment against a canned sequence of Coolify statuses, on a
+    simulated clock that each sleep advances. The last status repeats."""
     import asyncio
     import main
-    with patch('main.get_service_status', new=AsyncMock(side_effect=statuses)) as status, \
-         patch('main.asyncio.sleep', new=AsyncMock()):
+    clock = {"now": 1000.0}
+    remaining = list(statuses)
+
+    async def next_status(*args):
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    async def sleep(seconds):
+        clock["now"] += seconds
+
+    with patch('main.get_service_status', new=AsyncMock(side_effect=next_status)) as status, \
+         patch('main.asyncio.sleep', new=sleep), \
+         patch('main.time.time', new=lambda: clock["now"]):
         asyncio.run(main.watch_deployment(
             "http://coolify", "tok", "svc-1", baseline,
             container_name="meshmonitor", image="ghcr.io/yeraze/meshmonitor:latest",
             server="grawie-prod", **kwargs))
+    status.elapsed = clock["now"] - 1000.0
     return status
 
 
@@ -698,7 +710,7 @@ def test_watch_keeps_waiting_while_a_healthy_service_is_still_unhealthy(mock_not
     """running:unhealthy is not good enough when the resource has a healthcheck."""
     status = _watch(["running:unhealthy", "running:unhealthy", "running:healthy"])
 
-    assert status.await_count == 3
+    assert status.await_count >= 3
     mock_notify.assert_called_once()
     assert "✅" in mock_notify.call_args.args[1]
 
@@ -740,6 +752,48 @@ def test_watch_logs_only_status_changes(mock_notify, caplog):
                 "starting:unhealthy", "running:healthy"])
     watching = [r.message for r in caplog.records if r.message.startswith("Watching")]
     assert len(watching) == 3, watching
+
+
+@patch('main.send_notification')
+def test_watch_waits_for_the_service_to_stay_back(mock_notify):
+    """Coolify said running:healthy 2 s after mealie's new container started,
+    while Docker still had it at health: starting (2026-09-24): one good status
+    right after the restart proves nothing."""
+    import main
+    status = _watch(["starting:unhealthy", "running:healthy"])
+
+    mock_notify.assert_called_once()
+    assert "✅" in mock_notify.call_args.args[1]
+    assert status.elapsed >= main.WATCH_STABLE_SECONDS
+
+
+@patch('main.send_notification')
+def test_watch_does_not_report_success_for_a_version_that_crashes_after_starting(mock_notify):
+    _watch(["starting:unhealthy", "running:healthy", "running:healthy", "exited:unhealthy"],
+           timeout=300)
+
+    mock_notify.assert_called_once()
+    assert "⏱️" in mock_notify.call_args.args[1]
+    assert "exited:unhealthy" in mock_notify.call_args.args[2]
+
+
+@patch('main.send_notification')
+def test_watch_restarts_the_stability_window_after_a_relapse(mock_notify):
+    import main
+    statuses = (["starting:unhealthy"] + ["running:healthy"] * 10
+                + ["restarting:unhealthy", "running:healthy"])
+    status = _watch(statuses)
+
+    mock_notify.assert_called_once()
+    assert "✅" in mock_notify.call_args.args[1]
+    # 10 polls at 1 s before the relapse, then a full window after it
+    assert status.elapsed >= 11 + main.WATCH_STABLE_SECONDS
+
+
+def test_watch_stability_window_fits_in_the_fast_polling_window():
+    """At 1 s polls, a relapse inside the window is caught; after it, polls are 15 s apart."""
+    import main
+    assert 15 <= main.WATCH_STABLE_SECONDS < main.WATCH_TRANSITION_GRACE_SECONDS
 
 
 @patch('main.send_notification')
