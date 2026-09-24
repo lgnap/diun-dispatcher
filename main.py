@@ -759,11 +759,17 @@ def _notify_deployment_done(container_name: str, image: str, server: str,
 # a limit:
 #   diun-dispatcher.follow=patch  same major and minor (v6.10.1 -> v6.10.4)
 #   diun-dispatcher.follow=minor  same major           (v6.10.1 -> v6.11.0)
+#   diun-dispatcher.follow=announce  same major, announced but never applied
 # Never a major change, whatever the policy.
+#
+# announce exists because Diun (max_tags=1) only reports the highest tag of a
+# repository: once a v7 is out, the patches of a v6 in service go unannounced.
 
 SERIES_LABEL = "diun-dispatcher.follow"
 # How many leading version numbers each policy keeps fixed
-SERIES_POLICIES = {"patch": 2, "minor": 1}
+SERIES_POLICIES = {"patch": 2, "minor": 1, "announce": 1}
+# Policies that only tell, whatever AUTO_DEPLOY says
+SERIES_ANNOUNCE_ONLY = {"announce"}
 SERIES_DEFAULT_CHECK_HOUR = 5
 SERIES_MIN_INTERVAL_SECONDS = 24 * 60 * 60
 REGISTRY_MAX_PAGES = 50
@@ -1156,7 +1162,8 @@ async def check_series(service: dict, service_name: str, policy: str, image: str
         logger.info(f"{service_name} (service {uuid}) is up to date on {current_tag} ({policy})")
         return None
 
-    if is_auto_deploy_enabled():
+    announce_only = policy in SERIES_ANNOUNCE_ONLY
+    if is_auto_deploy_enabled() and not announce_only:
         return await upgrade_resource(service, service_name, target)
 
     key = f"{uuid}/{service_name}"
@@ -1168,7 +1175,8 @@ async def check_series(service: dict, service_name: str, policy: str, image: str
         f"🆕 {service_name} {current_tag} → {target} available",
         build_notification_body(
             _server_name(service), with_tag(image, target), service_name,
-            f"\n\nℹ️ Follow policy {policy}: AUTO_DEPLOY is off, nothing was applied."
+            ("\n\nℹ️ Follow policy announce: never applied automatically." if announce_only
+             else f"\n\nℹ️ Follow policy {policy}: AUTO_DEPLOY is off, nothing was applied.")
             + build_upgrade_link(uuid, service_name, target)),
     )
     return "proposed"
@@ -1335,8 +1343,9 @@ async def diun_webhook(request: Request):
                         f"(configured: {configured}), nothing to do")
             return JSONResponse({"ok": True, "uuid": uuid, "action": f"new-tag-{kind}"})
         # A resource following a virtual series (diun-dispatcher.follow) moves
-        # to a tag within its policy by itself: check it now rather than
-        # announcing it. Beyond the policy, announce as usual.
+        # to a tag within its policy by itself (or, with follow=announce, says
+        # so once): check it now rather than announcing it. Beyond the policy,
+        # announce as usual.
         series = await find_series_entry(coolify_url, matched_service, image) if uuid else None
         if series:
             series_service, name, entry = series

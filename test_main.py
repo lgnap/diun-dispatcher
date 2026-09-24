@@ -1495,3 +1495,49 @@ def test_new_event_beyond_the_policy_is_still_announced(mock_coolify, mock_notif
     assert resp.json()["action"] == "new-tag-notified"
     mock_notify.assert_called_once()
     check.assert_not_called()
+
+
+# --- announce-only series ----------------------------------------------------
+
+ANNOUNCED_LYCHEE = {**LYCHEE_SERVICE, "docker_compose_raw": LYCHEE_COMPOSE.replace(
+    "diun-dispatcher.follow=patch", "diun-dispatcher.follow=announce")}
+
+
+def test_announce_policy_follows_the_same_major():
+    from main import pick_series_target
+    assert pick_series_target("v6.10.1", ["v6.10.4", "v6.11.0", "v7.0.0"], "announce") == "v6.11.0"
+
+
+def test_announce_policy_never_applies_even_with_auto_deploy():
+    """The label says: tell me about my series, never touch it."""
+    _, _, upgrade, notify = _run_check([ANNOUNCED_LYCHEE], tags=["v6.10.1", "v6.10.4", "v7.0.0"])
+
+    upgrade.assert_not_awaited()
+    notify.assert_called_once()
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "v6.10.1 → v6.10.4" in title
+    assert "AUTO_DEPLOY" not in body, "AUTO_DEPLOY is on: the reason is the label"
+    assert "/upgrade?uuid=lychee-s" in body and "tag=v6.10.4" in body
+
+
+def test_announce_policy_announces_a_tag_once():
+    import asyncio
+    import main
+    _run_check([ANNOUNCED_LYCHEE], tags=["v6.10.1", "v6.10.4"])
+    with patch.dict(os.environ, SERIES_ENV, clear=True), \
+         patch("main.get_coolify_applications", new=AsyncMock(return_value=[ANNOUNCED_LYCHEE])), \
+         patch("main.list_registry_tags", new=AsyncMock(return_value=["v6.10.1", "v6.10.4"])), \
+         patch("main.send_notification") as notify_again:
+        asyncio.run(main.run_series_check())
+    notify_again.assert_not_called()
+
+
+def test_upgrade_link_applies_an_announced_tag():
+    """The link in the announcement is the one-click way to apply it."""
+    with patch.dict(os.environ, SERIES_ENV, clear=True), \
+         patch("main.get_service", new=AsyncMock(return_value=ANNOUNCED_LYCHEE)), \
+         patch("main.list_registry_tags", new=AsyncMock(return_value=LYCHEE_TAGS)), \
+         patch("main.upgrade_resource", new=AsyncMock(return_value="applied")) as upgrade:
+        resp = client.get("/upgrade?uuid=lychee-svc-uuid&service=lychee&tag=v6.10.4&secret=s3cret")
+    assert resp.status_code == 200
+    upgrade.assert_called_once()
