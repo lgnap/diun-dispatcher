@@ -57,7 +57,7 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | Variable        | Description |
 |-----------------|-------------|
 | `COOLIFY_API_URL` | Base URL of your Coolify instance (e.g., `https://coolify.example.com`). **Not** `COOLIFY_URL` — Coolify reserves the `COOLIFY_*` namespace and would override it with the app's own FQDN. |
-| `COOLIFY_TOKEN` | Coolify API token (generate in Settings → API) |
+| `COOLIFY_TOKEN` | Coolify API token (generate in Settings → API): `read` + `deploy`, plus `read:sensitive` + `write` for the [virtual series](#virtual-series-follow-patches-without-a-series-tag) |
 
 ### Optional environment variables
 
@@ -68,7 +68,6 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | `DISPATCHER_URL`      | (none)  | Your dispatcher URL for manual deploy links in notifications (e.g., `https://dispatcher.example.com`) |
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
-| `COOLIFY_WRITE_TOKEN` | `COOLIFY_TOKEN` | Coolify token with `read:sensitive` + `write`, used only by the [virtual series](#virtual-series-follow-patches-without-a-series-tag) |
 | `SERIES_CHECK_HOUR`   | `5`     | Hour of the day (0-23, container time zone) of the daily virtual series check |
 | `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file |
 | `CF_ACCESS_CLIENT_ID` | (none)  | Cloudflare Access client ID (if behind Cloudflare Access) |
@@ -268,9 +267,9 @@ Safeguards:
 - never a major change, whatever the policy.
 
 **Coolify token.** Reading a compose needs `read:sensitive` and rewriting it needs
-`write`; a deploy-only `COOLIFY_TOKEN` has neither. Create a second token for
-`COOLIFY_WRITE_TOKEN` (used only for listing composes and saving them), or widen
-`COOLIFY_TOKEN`. Coolify's answer to the save carries the service's environment
+`write`, on top of the `read` + `deploy` the dispatcher always needs: no Coolify
+permission implies another. One token for everything: a second one would live
+in the same container and protect nothing. Coolify's answer to the save carries the service's environment
 variables in clear: the dispatcher never logs it.
 
 **Diun filters.** Leave the Diun labels (`diun.include_tags`, `diun.max_tags`…)
