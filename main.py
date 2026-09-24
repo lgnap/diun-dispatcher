@@ -17,6 +17,21 @@ from fastapi.templating import Jinja2Templates
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+
+class SecretQueryFilter(logging.Filter):
+    """Mask the secret query parameter of /deploy and /upgrade in uvicorn's access log."""
+
+    PATTERN = re.compile(r"([?&]secret=)[^&\s]*")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(self.PATTERN.sub(r"\1***", a) if isinstance(a, str) else a
+                                for a in record.args)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(SecretQueryFilter())
+
 app = FastAPI(title="Diun Webhook Dispatcher")
 
 # Templates
@@ -465,7 +480,7 @@ def build_deploy_link(uuid: str) -> str:
     cache_uuid(uuid_short, uuid)
     secret_param = f"&secret={webhook_secret}" if webhook_secret else ""
     link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}{secret_param}"
-    logger.info(f"Generated deploy link: {link}")
+    logger.info(f"Generated deploy link for {uuid_short}")
     return link
 
 
