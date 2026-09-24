@@ -68,6 +68,8 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | `DISPATCHER_URL`      | (none)  | Your dispatcher URL for manual deploy links in notifications (e.g., `https://dispatcher.example.com`) |
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
+| `COOLIFY_WRITE_TOKEN` | `COOLIFY_TOKEN` | Coolify token with `read:sensitive` + `write`, used only by the [virtual series](#virtual-series-follow-patches-without-a-series-tag) |
+| `SERIES_CHECK_HOUR`   | `5`     | Hour of the day (0-23, container time zone) of the daily virtual series check |
 | `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file |
 | `CF_ACCESS_CLIENT_ID` | (none)  | Cloudflare Access client ID (if behind Cloudflare Access) |
 | `CF_ACCESS_CLIENT_SECRET` | (none) | Cloudflare Access client secret |
@@ -180,7 +182,8 @@ also announces new releases for resources pinned on an exact version (`n8n:2.40.
 numbers (`v1.27` → 1.27, `11.8-noble` → 11.8); a tag that does not start with a number
 (`latest`, `alpine`) cannot be ordered and is always announced.
 
-Your compose files are left untouched: nothing is pinned or rewritten, and the image
+Outside the [virtual series](#virtual-series-follow-patches-without-a-series-tag) opt-in,
+your compose files are left untouched: nothing is pinned or rewritten, and the image
 pull is requested explicitly for that one deployment. An ordinary restart — from
 Coolify's UI, or because the container came back up on its own — still deploys the
 same content as before, so nothing updates behind your back.
@@ -214,6 +217,66 @@ What you get:
 | The service never came back within 15 minutes | `⏱️ <container> — deployment status unknown`, with the last status seen and a manual deploy link |
 
 A successful auto-deploy sends **one** notification, once it is over.
+
+## Virtual series: follow patches without a series tag
+
+Pinning on a series tag only works when the publisher publishes one. Some don't:
+lychee (`v6.10.1`, no `v6` nor `v6.10`), mealie (`v3.21.0`), n8n (`2.40.5`). Pinned
+on an exact version, they never receive anything. For those, add a label to the
+service **in the compose Coolify holds**, and the dispatcher moves the tag itself,
+within a limit:
+
+| Label | Follows | From `v6.10.1` |
+|---|---|---|
+| `diun-dispatcher.follow=patch` | same major and minor | → `v6.10.4`, never `v6.11.0` |
+| `diun-dispatcher.follow=minor` | same major | → `v6.11.0`, never `v7.0.0` |
+| (none) | nothing | current behaviour: announce only |
+
+```yaml
+services:
+  lychee:
+    image: lycheeorg/lychee:v6.10.1
+    labels:
+      - diun-dispatcher.follow=patch
+```
+
+Once a day (`SERIES_CHECK_HOUR`), for each labelled service, the dispatcher:
+
+1. lists the tags the registry publishes (Docker Hub, ghcr.io and other public
+   registries; private registries are not supported);
+2. keeps those the policy allows, **of the same form** as the tag in service: same
+   `v` prefix, as many numbers, same suffix — `-rc1`, `-beta`, `-amd64`, `-pc`
+   tags are left out;
+3. if the highest is newer: rewrites the **`image:` line only** of that service
+   (`PATCH /api/v1/services/{uuid}`), reads the compose back to check nothing else
+   changed (quotes Coolify adds do not count), restarts with
+   `restart?latest=true` and watches the service as for an auto-deploy;
+4. notifies `✅ lychee v6.10.1 → v6.10.4 applied`, or `❌ … failed` — in which case
+   the original compose is put back (and restarted, if the new version had already
+   been deployed).
+
+A Diun `new` event for a tag within the policy triggers that check right away
+instead of the usual announcement; a tag beyond the policy (a new major) is
+announced as before.
+
+Safeguards:
+- without `AUTO_DEPLOY`, nothing is applied: you get `🆕 … available` with a link
+  (`GET /upgrade`) that applies it — once per proposed tag;
+- `IGNORE_CONTAINERS` applies (the compose service name, or `<name>-<uuid>`);
+- one upgrade at a time per resource, at most one attempt a day (the manual link
+  included);
+- never a major change, whatever the policy.
+
+**Coolify token.** Reading a compose needs `read:sensitive` and rewriting it needs
+`write`; a deploy-only `COOLIFY_TOKEN` has neither. Create a second token for
+`COOLIFY_WRITE_TOKEN` (used only for listing composes and saving them), or widen
+`COOLIFY_TOKEN`. Coolify's answer to the save carries the service's environment
+variables in clear: the dispatcher never logs it.
+
+**Diun filters.** Leave the Diun labels (`diun.include_tags`, `diun.max_tags`…)
+alone: `include_tags` also applies to the tag in service, and the dispatcher reads
+the registry itself, so a correction in an older major is found even when Diun
+only follows the highest tag.
 
 ## API endpoints
 
@@ -266,6 +329,18 @@ locally, so it would redeploy exactly the content Diun just reported as outdated
 }
 ```
 
+### GET `/upgrade`
+
+Applies an upgrade proposed by the [virtual series](#virtual-series-follow-patches-without-a-series-tag)
+check when `AUTO_DEPLOY` is off. Used in notification links.
+
+**Parameters:** `uuid` (short or full service UUID), `service` (compose service
+name), `tag` (target tag), `secret` (must match `WEBHOOK_SECRET`).
+
+The dispatcher checks again that the tag is published, newer, and within the
+service's policy (`400` otherwise), then runs the upgrade in the background; the
+outcome arrives as a notification.
+
 ### GET `/health`
 
 Health check endpoint.
@@ -294,7 +369,7 @@ Example:
 🖼️ Image: ghcr.io/music-assistant/server:latest
 📦 Container: music-assistant
 
-🚀 Déployer [a1b2c3d4]: https://dispatcher.example.com/deploy?uuid=...
+🚀 Deploy [a1b2c3d4]: https://dispatcher.example.com/deploy?uuid=...
 ```
 
 ## Cloudflare Access

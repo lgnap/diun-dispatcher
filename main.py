@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+import base64
 import os
 import json
 import logging
@@ -7,7 +8,10 @@ import re
 import apprise
 import httpx
 import time
+import yaml
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urljoin
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
@@ -194,9 +198,12 @@ def log_environment_config():
     logger.info(f"DISPATCHER_URL: {'✓ configured' if dispatcher_url else '✗ not configured'}")
 
     # Check ignore list
-    ignore_containers_raw = os.getenv("IGNORE_CONTAINERS", "").strip()
-    ignore_count = len([c.strip() for c in ignore_containers_raw.split(",") if c.strip()]) if ignore_containers_raw else 0
-    logger.info(f"IGNORE_CONTAINERS: {ignore_count} container(s) to ignore")
+    logger.info(f"IGNORE_CONTAINERS: {len(ignored_containers())} container(s) to ignore")
+
+    # Check the series follow-up (diun-dispatcher.follow labels)
+    write_token = os.getenv("COOLIFY_WRITE_TOKEN", "").strip()
+    logger.info(f"COOLIFY_WRITE_TOKEN: {'✓ configured' if write_token else '✗ not configured (COOLIFY_TOKEN used)'}")
+    logger.info(f"SERIES_CHECK_HOUR: series check every day at {series_check_hour()}:00")
 
     logger.info("=== End Configuration ===\n")
 
@@ -479,7 +486,7 @@ def build_deploy_link(uuid: str) -> str:
     uuid_short = uuid[:SHORT_UUID_LENGTH]
     cache_uuid(uuid_short, uuid)
     secret_param = f"&secret={webhook_secret}" if webhook_secret else ""
-    link = f"\n\n🚀 Déployer [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}{secret_param}"
+    link = f"\n\n🚀 Deploy [{uuid_short}]: {dispatcher_url}/deploy?uuid={uuid_short}{secret_param}"
     logger.info(f"Generated deploy link for {uuid_short}")
     return link
 
@@ -575,8 +582,10 @@ def extract_deployments_from_services(services: list[dict]) -> list[dict]:
 @app.on_event("startup")
 async def startup_event():
     """Initialize cache and log configuration on application startup"""
+    global _series_task
     _load_cache_from_disk()
     log_environment_config()
+    _series_task = asyncio.create_task(series_check_loop())
 
 
 @app.on_event("shutdown")
@@ -646,15 +655,15 @@ def watch_interval(elapsed: float, grace: float = WATCH_TRANSITION_GRACE_SECONDS
     return WATCH_FAST_INTERVAL_SECONDS if elapsed < grace else WATCH_SLOW_INTERVAL_SECONDS
 
 
-async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
-                           baseline_status: str, container_name: str, image: str,
-                           server: str, timeout: float = WATCH_TIMEOUT_SECONDS,
-                           grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> None:
-    """Follow a redeploy until the resource is back, then notify.
+async def wait_for_service(coolify_url: str, coolify_token: str, uuid: str,
+                           baseline_status: str, container_name: str,
+                           timeout: float = WATCH_TIMEOUT_SECONDS,
+                           grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> tuple[bool, str | None, str]:
+    """Follow a redeploy until the resource is back to its baseline status.
 
-    Coolify notifies webhooks for deployments, not for the restart we trigger, so
-    the outcome is read from the resource status instead. Success means the status
-    left its baseline and came back to it — with the health the baseline had.
+    Returns (back, last status, note): back is False when the resource did not
+    come back before the timeout; the note says when the restart was too quick
+    to be observed.
     """
     deadline = time.time() + timeout
     started = time.time()
@@ -670,34 +679,47 @@ async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
 
         if status is not None and status_is_at_least(status, baseline_status):
             if transition_seen:
-                _notify_deployment_done(container_name, image, server, status, "")
-                return
+                return True, status, ""
             if time.time() - started >= grace:
                 # Coolify refreshes statuses on its own schedule; a restart that
                 # finished between two polls is invisible to us. That is the
                 # normal case for a service that comes back in a few seconds.
-                _notify_deployment_done(
-                    container_name, image, server, status,
-                    f" {int(grace)} s after the redeploy (restart too quick to observe)",
-                )
-                return
+                return True, status, f" {int(grace)} s after the redeploy (restart too quick to observe)"
         elif status is not None:
             transition_seen = True
 
         if time.time() >= deadline:
             logger.warning(f"Gave up watching {container_name}: last status={status}")
-            send_notification(
-                load_apprise_urls(),
-                f"⏱️ {container_name} — deployment status unknown",
-                build_notification_body(
-                    server, image, container_name,
-                    f"\n\n⚠️ Redeploy triggered, but the service never came back."
-                    f"\n📊 Last status: {status}" + build_deploy_link(uuid),
-                ),
-            )
-            return
+            return False, status, ""
 
         await asyncio.sleep(watch_interval(time.time() - started, grace))
+
+
+async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
+                           baseline_status: str, container_name: str, image: str,
+                           server: str, timeout: float = WATCH_TIMEOUT_SECONDS,
+                           grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> None:
+    """Follow a redeploy until the resource is back, then notify.
+
+    Coolify notifies webhooks for deployments, not for the restart we trigger, so
+    the outcome is read from the resource status instead. Success means the status
+    left its baseline and came back to it — with the health the baseline had.
+    """
+    back, status, note = await wait_for_service(
+        coolify_url, coolify_token, uuid, baseline_status, container_name,
+        timeout=timeout, grace=grace)
+    if back:
+        _notify_deployment_done(container_name, image, server, status, note)
+        return
+    send_notification(
+        load_apprise_urls(),
+        f"⏱️ {container_name} — deployment status unknown",
+        build_notification_body(
+            server, image, container_name,
+            f"\n\n⚠️ Redeploy triggered, but the service never came back."
+            f"\n📊 Last status: {status}" + build_deploy_link(uuid),
+        ),
+    )
 
 
 def _notify_deployment_done(container_name: str, image: str, server: str,
@@ -708,6 +730,507 @@ def _notify_deployment_done(container_name: str, image: str, server: str,
         build_notification_body(server, image, container_name,
                                 f"\n📊 Status: {status}{extra}"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Virtual series: follow the patches of an image that publishes no series tag
+# ---------------------------------------------------------------------------
+#
+# A resource pinned on a series tag (gitea/gitea:1.27) gets its patches by
+# itself: the publisher republishes 1.27 and Diun sends an "update". Some
+# publishers have no series tag at all (lychee v6.10.1, mealie v3.21.0, n8n
+# 2.40.5): pinned on an exact version, they would never receive anything. A
+# label on the compose service lets the dispatcher move the tag itself, within
+# a limit:
+#   diun-dispatcher.follow=patch  same major and minor (v6.10.1 -> v6.10.4)
+#   diun-dispatcher.follow=minor  same major           (v6.10.1 -> v6.11.0)
+# Never a major change, whatever the policy.
+
+SERIES_LABEL = "diun-dispatcher.follow"
+# How many leading version numbers each policy keeps fixed
+SERIES_POLICIES = {"patch": 2, "minor": 1}
+SERIES_DEFAULT_CHECK_HOUR = 5
+SERIES_MIN_INTERVAL_SECONDS = 24 * 60 * 60
+REGISTRY_MAX_PAGES = 50
+
+# In-memory only: a restart forgets them, at worst one more proposal or attempt.
+_series_last_attempt: dict[str, float] = {}
+_series_proposed: dict[str, str] = {}
+_series_locks: dict[str, asyncio.Lock] = {}
+_series_task: asyncio.Task | None = None
+_background_tasks: set[asyncio.Task] = set()
+
+TAG_PATTERN = re.compile(r"(v?)(\d+(?:\.\d+)*)(-[A-Za-z0-9.-]+)?")
+
+
+def parse_tag(tag: str) -> tuple[str, tuple[int, ...], str] | None:
+    """Split a version tag into its form: "v6.10.1" -> ("v", (6, 10, 1), ""),
+    "11.8-noble" -> ("", (11, 8), "-noble"). None for a tag that is not a version."""
+    match = TAG_PATTERN.fullmatch(tag.strip())
+    if not match:
+        return None
+    prefix, numbers, suffix = match.groups()
+    return prefix, tuple(int(part) for part in numbers.split(".")), suffix or ""
+
+
+def pick_series_target(current_tag: str, tags: list[str], policy: str) -> str | None:
+    """The highest published tag the policy allows moving to, if newer than the
+    one in service. Only tags of the very same form qualify: same "v" prefix, as
+    many numbers, same suffix -- which also leaves out pre-releases (-rc1,
+    -beta, -legacy) for a resource running a plain version."""
+    fixed = SERIES_POLICIES.get(policy)
+    current = parse_tag(current_tag)
+    if fixed is None or current is None:
+        return None
+    prefix, numbers, suffix = current
+    best, best_numbers = None, numbers
+    for tag in tags:
+        parsed = parse_tag(tag)
+        if parsed is None:
+            continue
+        tag_prefix, tag_numbers, tag_suffix = parsed
+        if (tag_prefix, len(tag_numbers), tag_suffix) != (prefix, len(numbers), suffix):
+            continue
+        if tag_numbers[:fixed] != numbers[:fixed]:
+            continue
+        if tag_numbers > best_numbers:
+            best, best_numbers = tag, tag_numbers
+    return best
+
+
+def _load_compose(raw: str | None) -> dict:
+    """Parse a compose file with every scalar kept as a string.
+
+    BaseLoader resolves no types, so 'yes' and yes, or '8000' and 8000, compare
+    equal: Coolify re-dumps the compose on save and adds quotes (around image:,
+    among others) that must not count as a change.
+    """
+    try:
+        doc = yaml.load(raw or "", Loader=yaml.BaseLoader)
+    except yaml.YAMLError as e:
+        logger.warning(f"Could not parse a compose file: {type(e).__name__}")
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def series_policies(raw: str | None) -> dict[str, dict]:
+    """The compose services that carry a series label: {name: {policy, image}}."""
+    services = _load_compose(raw).get("services")
+    if not isinstance(services, dict):
+        return {}
+    found = {}
+    for name, service in services.items():
+        if not isinstance(service, dict):
+            continue
+        labels = service.get("labels")
+        policy = None
+        if isinstance(labels, dict):
+            policy = labels.get(SERIES_LABEL)
+        elif isinstance(labels, list):
+            for label in labels:
+                key, _, value = str(label).partition("=")
+                if key.strip() == SERIES_LABEL:
+                    policy = value
+        if policy is None:
+            continue
+        policy = str(policy).strip().lower()
+        image = service.get("image")
+        if policy not in SERIES_POLICIES:
+            logger.warning(f"Unknown {SERIES_LABEL}={policy} on {name}, ignored")
+        elif isinstance(image, str) and image and "$" not in image:
+            found[name] = {"policy": policy, "image": image}
+    return found
+
+
+IMAGE_LINE = re.compile(r"(\s*image:\s*)(['\"]?)([^'\"#\s]+)\2(\s*(?:#.*)?)")
+
+
+def rewrite_image_line(raw: str, service_name: str, new_image: str) -> str | None:
+    """Replace the image: line of one compose service, and nothing else.
+
+    Text is edited rather than parsed and re-dumped: a YAML round trip here
+    would reinterpret values (yes, on, 010) and reorder the file. None when the
+    service or its image: line cannot be found.
+    """
+    lines = raw.splitlines(keepends=True)
+    in_services = in_target = False
+    service_indent = key_indent = None
+    for i, line in enumerate(lines):
+        text = line.rstrip("\r\n")
+        stripped = text.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(text) - len(text.lstrip(" "))
+        if indent == 0:
+            in_services = re.fullmatch(r"services:\s*(#.*)?", stripped) is not None
+            in_target, service_indent = False, None
+            continue
+        if not in_services:
+            continue
+        if service_indent is None:
+            service_indent = indent
+        if indent <= service_indent:
+            name = re.fullmatch(r"(['\"]?)([^'\":]+)\1:\s*(#.*)?", stripped)
+            in_target = indent == service_indent and name is not None and name.group(2) == service_name
+            key_indent = None
+            continue
+        if not in_target:
+            continue
+        if key_indent is None:
+            key_indent = indent
+        if indent == key_indent:
+            match = IMAGE_LINE.fullmatch(text)
+            if match:
+                lead, quote, _, trail = match.groups()
+                lines[i] = f"{lead}{quote}{new_image}{quote}{trail}{line[len(text):]}"
+                return "".join(lines)
+    return None
+
+
+def compose_matches(saved_raw: str | None, original_raw: str, service_name: str,
+                    new_image: str) -> bool:
+    """Is the saved compose the original one with only that image changed?"""
+    expected = _load_compose(original_raw)
+    services = expected.get("services")
+    if not isinstance(services, dict) or not isinstance(services.get(service_name), dict):
+        return False
+    services[service_name]["image"] = new_image
+    return _load_compose(saved_raw) == expected
+
+
+def with_tag(image: str, tag: str) -> str:
+    """The same image reference with another tag."""
+    ref = image.strip().split("@", 1)[0]
+    head, _, last = ref.rpartition("/")
+    name = last.split(":", 1)[0]
+    return f"{head}/{name}:{tag}" if head else f"{name}:{tag}"
+
+
+def registry_repository(image: str) -> tuple[str, str]:
+    """Where to list an image's tags: (registry host, repository)."""
+    normalized = normalize_image(image)
+    head, separator, remainder = normalized.partition("/")
+    if separator and ("." in head or ":" in head or head == "localhost"):
+        return head, remainder
+    repository = normalized if "/" in normalized else DOCKER_HUB_IMPLICIT_NAMESPACE + normalized
+    return "registry-1.docker.io", repository
+
+
+async def _registry_token(client: httpx.AsyncClient, challenge: str) -> str | None:
+    """Get an anonymous pull token from the realm a registry's 401 points to."""
+    params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+    realm = params.pop("realm", None)
+    if not realm:
+        return None
+    resp = await client.get(realm, params=params)
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload.get("token") or payload.get("access_token")
+
+
+async def list_registry_tags(image: str) -> list[str] | None:
+    """Every tag the registry publishes for this image, or None on failure.
+
+    Registry API v2 with an anonymous token: Docker Hub, ghcr.io and other
+    public registries. Private registries are out of scope.
+    """
+    host, repository = registry_repository(image)
+    url = f"https://{host}/v2/{repository}/tags/list?n=1000"
+    headers: dict = {}
+    tags: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            for _ in range(REGISTRY_MAX_PAGES):
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 401 and not headers:
+                    token = await _registry_token(client, resp.headers.get("WWW-Authenticate", ""))
+                    if not token:
+                        raise RuntimeError("no anonymous token offered")
+                    headers = {"Authorization": f"Bearer {token}"}
+                    resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+                tags.extend(resp.json().get("tags") or [])
+                next_url = resp.links.get("next", {}).get("url")
+                if not next_url:
+                    break
+                url = urljoin(url, next_url)
+    except Exception as e:
+        logger.error(f"✗ Could not list the tags of {host}/{repository}: {e}")
+        return None
+    logger.info(f"Registry {host}/{repository}: {len(tags)} tag(s)")
+    return tags
+
+
+def get_write_token() -> str:
+    """The Coolify token allowed to read and rewrite composes.
+
+    Reading docker_compose_raw needs read:sensitive and rewriting it needs
+    write, which the deploy-only COOLIFY_TOKEN usually lacks.
+    """
+    return os.getenv("COOLIFY_WRITE_TOKEN", "").strip() or os.getenv("COOLIFY_TOKEN", "").strip()
+
+
+async def get_service(coolify_url: str, coolify_token: str, uuid: str) -> dict | None:
+    """Read one Coolify service, or None if unreachable."""
+    url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"
+    headers = {"Authorization": f"Bearer {coolify_token}", **get_cloudflare_headers()}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"Could not read service {uuid}: {type(e).__name__}")
+        return None
+
+
+async def patch_compose(coolify_url: str, coolify_token: str, uuid: str, raw: str) -> bool:
+    """Save a new compose for a Coolify service.
+
+    The response carries the service's environment variables in clear: it is
+    never logged, only its status code.
+    """
+    url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"
+    headers = {"Authorization": f"Bearer {coolify_token}", **get_cloudflare_headers()}
+    body = {"docker_compose_raw": base64.b64encode(raw.encode()).decode()}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.patch(url, headers=headers, json=body)
+    except Exception as e:
+        logger.error(f"✗ Could not save the compose of service {uuid}: {type(e).__name__}")
+        return False
+    if resp.is_success:
+        logger.info(f"✓ Compose of service {uuid} saved (status {resp.status_code})")
+        return True
+    logger.error(f"✗ Coolify refused the compose of service {uuid}: status {resp.status_code}")
+    return False
+
+
+def ignored_containers() -> list[str]:
+    raw = os.getenv("IGNORE_CONTAINERS", "").strip()
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
+def is_series_ignored(uuid: str, service_name: str) -> bool:
+    """IGNORE_CONTAINERS names containers: Coolify names them <service>-<uuid>."""
+    ignored = ignored_containers()
+    return service_name in ignored or f"{service_name}-{uuid}" in ignored
+
+
+def _series_lock(key: str) -> asyncio.Lock:
+    return _series_locks.setdefault(key, asyncio.Lock())
+
+
+def series_upgrade_blocked(key: str) -> str | None:
+    """Why an upgrade of this resource cannot start now: "busy", "too-soon", or None."""
+    if _series_lock(key).locked():
+        logger.info(f"Upgrade of {key} already running, skipped")
+        return "busy"
+    if time.time() - _series_last_attempt.get(key, 0) < SERIES_MIN_INTERVAL_SECONDS:
+        logger.info(f"{key} was already upgraded in the last 24 h, skipped")
+        return "too-soon"
+    return None
+
+
+def spawn(coro) -> None:
+    """Run a coroutine in the background, keeping a reference until it ends."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def build_upgrade_link(uuid: str, service_name: str, tag: str) -> str:
+    """The manual link that applies a proposed upgrade (empty if not configurable)."""
+    dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
+    if not dispatcher_url:
+        return ""
+    webhook_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    uuid_short = uuid[:SHORT_UUID_LENGTH]
+    cache_uuid(uuid_short, uuid)
+    secret_param = f"&secret={webhook_secret}" if webhook_secret else ""
+    return (f"\n\n🚀 Apply: {dispatcher_url}/upgrade?uuid={uuid_short}"
+            f"&service={service_name}&tag={tag}{secret_param}")
+
+
+def _server_name(service: dict) -> str:
+    return (service.get("server") or {}).get("name") or "unknown"
+
+
+async def upgrade_resource(service: dict, service_name: str, target_tag: str) -> str:
+    """Move one compose service of a Coolify service to target_tag, guarded.
+
+    One upgrade at a time per resource, at most one attempt a day. Returns
+    "applied", "failed", "busy" or "too-soon".
+    """
+    key = f"{service.get('uuid', '')}/{service_name}"
+    blocked = series_upgrade_blocked(key)
+    if blocked:
+        return blocked
+    async with _series_lock(key):
+        _series_last_attempt[key] = time.time()
+        return await _apply_series_upgrade(service, service_name, target_tag)
+
+
+async def _apply_series_upgrade(service: dict, service_name: str, target_tag: str) -> str:
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    deploy_token = os.getenv("COOLIFY_TOKEN", "").strip()
+    write_token = get_write_token()
+    uuid = service.get("uuid", "")
+    server = _server_name(service)
+    urls = load_apprise_urls()
+
+    # Work from the compose as saved right now, not from a listing that may be old
+    current = await get_service(coolify_url, write_token, uuid)
+    original_raw = (current or {}).get("docker_compose_raw")
+    entry = series_policies(original_raw).get(service_name)
+    if not entry:
+        logger.error(f"✗ Cannot read the compose of {service_name} (service {uuid}): "
+                     f"is COOLIFY_WRITE_TOKEN allowed to read sensitive data?")
+        send_notification(urls, f"❌ {service_name} — cannot upgrade to {target_tag}",
+                          build_notification_body(server, target_tag, service_name,
+                                                  "\n\n⚠️ Compose not readable: nothing was changed."))
+        return "failed"
+
+    old_image = entry["image"]
+    new_image = with_tag(old_image, target_tag)
+    change = f"{image_tag(old_image)} → {target_tag}"
+    baseline_status = current.get("status") or service.get("status", "")
+
+    def fail(reason: str, restored: bool) -> str:
+        restored_text = "\n↩️ Original compose restored." if restored else ""
+        send_notification(urls, f"❌ {service_name} {change} failed",
+                          build_notification_body(server, new_image, service_name,
+                                                  f"\n\n⚠️ {reason}{restored_text}"))
+        return "failed"
+
+    async def restore() -> bool:
+        return await patch_compose(coolify_url, write_token, uuid, original_raw)
+
+    new_raw = rewrite_image_line(original_raw, service_name, new_image)
+    if new_raw is None or not compose_matches(new_raw, original_raw, service_name, new_image):
+        return fail("The image: line could not be rewritten: nothing was changed.", False)
+
+    logger.info(f"Upgrading {service_name} (service {uuid}): {old_image} → {new_image}")
+    if not await patch_compose(coolify_url, write_token, uuid, new_raw):
+        # The save may still have gone through (a timeout): put the original back
+        return fail("Coolify refused the new compose.", await restore())
+
+    saved = await get_service(coolify_url, write_token, uuid)
+    if not compose_matches((saved or {}).get("docker_compose_raw"), original_raw, service_name, new_image):
+        logger.error(f"✗ The compose Coolify saved for {service_name} differs beyond the image line")
+        return fail("The compose Coolify saved differs beyond the image: line.",
+                    await restore())
+
+    if not (await trigger_coolify(coolify_url, deploy_token, uuid))["ok"]:
+        return fail("Coolify refused the redeploy.", await restore())
+
+    back, status, note = await wait_for_service(coolify_url, deploy_token, uuid,
+                                                baseline_status, service_name)
+    if back:
+        send_notification(urls, f"✅ {service_name} {change} applied",
+                          build_notification_body(server, new_image, service_name,
+                                                  f"\n📊 Status: {status}{note}"))
+        return "applied"
+
+    restored = await restore()
+    if restored:
+        # Bring the previous version back up
+        await trigger_coolify(coolify_url, deploy_token, uuid)
+    return fail(f"The service never came back (last status: {status}).", restored)
+
+
+async def check_series(service: dict, service_name: str, policy: str, image: str) -> str | None:
+    """Look for a newer tag within the policy and apply it, or propose it."""
+    uuid = service.get("uuid", "")
+    tags = await list_registry_tags(image)
+    if not tags:
+        return None
+    current_tag = image_tag(image)
+    target = pick_series_target(current_tag, tags, policy)
+    if target is None:
+        logger.info(f"{service_name} (service {uuid}) is up to date on {current_tag} ({policy})")
+        return None
+
+    if is_auto_deploy_enabled():
+        return await upgrade_resource(service, service_name, target)
+
+    key = f"{uuid}/{service_name}"
+    if _series_proposed.get(key) == target:
+        return None
+    _series_proposed[key] = target
+    send_notification(
+        load_apprise_urls(),
+        f"🆕 {service_name} {current_tag} → {target} available",
+        build_notification_body(
+            _server_name(service), with_tag(image, target), service_name,
+            f"\n\nℹ️ Follow policy {policy}: AUTO_DEPLOY is off, nothing was applied."
+            + build_upgrade_link(uuid, service_name, target)),
+    )
+    return "proposed"
+
+
+async def run_series_check() -> None:
+    """One pass over every Coolify resource carrying a series label."""
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    token = get_write_token()
+    if not coolify_url or not token:
+        logger.warning("Series check skipped: Coolify not configured")
+        return
+    services = await get_coolify_applications(coolify_url, token)
+    if services and not any(s.get("docker_compose_raw") for s in services):
+        logger.warning("Series check: Coolify hides every compose, "
+                       "COOLIFY_WRITE_TOKEN needs the read:sensitive permission")
+        return
+    for service in services:
+        uuid = service.get("uuid", "")
+        for name, entry in series_policies(service.get("docker_compose_raw")).items():
+            if is_series_ignored(uuid, name):
+                logger.info(f"{name} (service {uuid}) is in IGNORE_CONTAINERS, series check skipped")
+                continue
+            try:
+                await check_series(service, name, entry["policy"], entry["image"])
+            except Exception:
+                logger.exception(f"Series check of {name} (service {uuid}) failed")
+
+
+async def find_series_entry(coolify_url: str, service: dict, image: str) -> tuple[dict, str, dict] | None:
+    """The labelled compose service of this Coolify service that runs the image:
+    (service with its compose, compose service name, {policy, image})."""
+    full = await get_service(coolify_url, get_write_token(), service.get("uuid", ""))
+    if not full:
+        return None
+    merged = {**service, **full}
+    wanted = normalize_image(image)
+    for name, entry in series_policies(merged.get("docker_compose_raw")).items():
+        if normalize_image(entry["image"]) == wanted:
+            return merged, name, entry
+    return None
+
+
+def series_check_hour() -> int:
+    raw = os.getenv("SERIES_CHECK_HOUR", "").strip()
+    if raw.isdigit() and int(raw) < 24:
+        return int(raw)
+    if raw:
+        logger.warning(f"SERIES_CHECK_HOUR={raw} is not an hour (0-23), using {SERIES_DEFAULT_CHECK_HOUR}")
+    return SERIES_DEFAULT_CHECK_HOUR
+
+
+def seconds_until_next_check(now: datetime, hour: int) -> float:
+    """Seconds from now to the next time the clock shows hour:00."""
+    target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def series_check_loop() -> None:
+    while True:
+        await asyncio.sleep(seconds_until_next_check(datetime.now(), series_check_hour()))
+        try:
+            await run_series_check()
+        except Exception:
+            logger.exception("Series check failed")
 
 
 # ---------------------------------------------------------------------------
@@ -763,9 +1286,7 @@ async def diun_webhook(request: Request):
         return JSONResponse({"ok": True, "action": "ignored"})
 
     # Check if container is in ignore list
-    ignore_containers_raw = os.getenv("IGNORE_CONTAINERS", "").strip()
-    ignore_containers = [c.strip() for c in ignore_containers_raw.split(",") if c.strip()]
-    if container_name in ignore_containers:
+    if container_name in ignored_containers():
         logger.info(f"Container {container_name} is in ignore list, skipping notification")
         return JSONResponse({"ok": True, "action": "ignored"})
 
@@ -808,13 +1329,24 @@ async def diun_webhook(request: Request):
             logger.info(f"New tag {image} is {kind} for {container_name} "
                         f"(configured: {configured}), nothing to do")
             return JSONResponse({"ok": True, "uuid": uuid, "action": f"new-tag-{kind}"})
+        # A resource following a virtual series (diun-dispatcher.follow) moves
+        # to a tag within its policy by itself: check it now rather than
+        # announcing it. Beyond the policy, announce as usual.
+        series = await find_series_entry(coolify_url, matched_service, image) if uuid else None
+        if series:
+            series_service, name, entry = series
+            if pick_series_target(image_tag(entry["image"]), [image_tag(image)], entry["policy"]):
+                logger.info(f"New tag {image} is within the {entry['policy']} policy of {name}, "
+                            f"checking its series")
+                spawn(check_series(series_service, name, entry["policy"], entry["image"]))
+                return JSONResponse({"ok": True, "uuid": uuid, "action": "series-check"})
         running = f" (running {image_tag(configured)})" if configured else ""
         send_notification(
             apprise_urls,
             f"{status_emoji} {container_name} — new version available: {image_tag(image)}{running}",
             build_notification_body(
                 server_display, image, container_name,
-                "\n\nℹ️ Pas de déploiement automatique : changer l'étiquette dans Coolify pour monter de version."),
+                "\n\nℹ️ No automatic deployment: change the tag in Coolify to upgrade."),
         )
         return JSONResponse({"ok": True, "uuid": uuid, "action": "new-tag-notified"})
 
@@ -917,6 +1449,52 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
         "hostname": hostname,
         "uuid": resolved_uuid,
         "recent_deployments": _recent_deployments
+    })
+
+
+@app.get("/upgrade")
+async def manual_upgrade(request: Request, uuid: str, service: str, tag: str, secret: str = ""):
+    """Apply an upgrade proposed by the series check (link in the notification)."""
+    expected_secret = os.getenv("WEBHOOK_SECRET", "").strip()
+    if expected_secret and secret != expected_secret:
+        logger.warning("Invalid upgrade secret")
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    resolved_uuid = uuid
+    if len(uuid) <= SHORT_UUID_LENGTH:
+        resolved_uuid = get_uuid_from_cache(uuid)
+        if not resolved_uuid:
+            raise HTTPException(status_code=404, detail="UUID not found in cache (may be expired)")
+
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    if not coolify_url or not get_write_token():
+        raise HTTPException(status_code=500, detail="Coolify not configured")
+
+    coolify_service = await get_service(coolify_url, get_write_token(), resolved_uuid)
+    entry = series_policies((coolify_service or {}).get("docker_compose_raw")).get(service)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"No {SERIES_LABEL} label on {service}")
+
+    # Re-check everything the link claims: the tag must still be newer, within
+    # the policy, and published.
+    tags = await list_registry_tags(entry["image"]) or []
+    if tag not in tags or pick_series_target(image_tag(entry["image"]), [tag], entry["policy"]) != tag:
+        raise HTTPException(status_code=400,
+                            detail=f"{tag} is not an upgrade within the {entry['policy']} policy")
+
+    # The upgrade lasts as long as the restart (up to WATCH_TIMEOUT_SECONDS):
+    # run it in the background, its outcome comes as a notification.
+    blocked = series_upgrade_blocked(f"{resolved_uuid}/{service}")
+    if not blocked:
+        spawn(upgrade_resource(coolify_service, service, tag))
+    return templates.TemplateResponse("deploy_confirmation.html", {
+        "request": request,
+        "deployed": blocked is None,
+        "container_name": f"{service} ({blocked or 'upgrade started'})",
+        "image": with_tag(entry["image"], tag),
+        "hostname": _server_name(coolify_service),
+        "uuid": resolved_uuid,
+        "recent_deployments": _recent_deployments,
     })
 
 
