@@ -958,3 +958,27 @@ def test_new_release_inside_the_series_in_service_is_not_announced(mock_coolify,
     assert resp.json()["action"] == "new-tag-in-series"
     mock_trigger.assert_not_called()
     mock_notify.assert_not_called()
+
+
+def test_deploy_link_does_not_log_the_secret(caplog):
+    """The link carries WEBHOOK_SECRET: it goes to the notification, never to the logs."""
+    import logging
+    from main import build_deploy_link
+    env = {"DISPATCHER_URL": "https://dispatcher.example", "WEBHOOK_SECRET": "s3cret"}
+    with patch.dict(os.environ, env, clear=True), caplog.at_level(logging.INFO, logger="main"):
+        link = build_deploy_link("abcdefgh12345678")
+    assert "secret=s3cret" in link
+    assert "s3cret" not in caplog.text
+
+
+def test_access_log_masks_the_secret_query_parameter():
+    """Uvicorn logs the full path of a click on /deploy, query string included."""
+    import logging
+    from main import SecretQueryFilter
+    record = logging.LogRecord("uvicorn.access", logging.INFO, "", 0,
+                               '%s - "%s %s HTTP/%s" %d',
+                               ("1.2.3.4:5", "GET", "/deploy?uuid=abc&secret=s3cret", "1.1", 200),
+                               None)
+    assert SecretQueryFilter().filter(record)
+    assert "s3cret" not in record.getMessage()
+    assert "/deploy?uuid=abc&secret=***" in record.getMessage()
