@@ -69,6 +69,9 @@ WATCH_FAST_INTERVAL_SECONDS = 1
 WATCH_SLOW_INTERVAL_SECONDS = 15
 WATCH_TIMEOUT_SECONDS = 15 * 60
 WATCH_TRANSITION_GRACE_SECONDS = 60
+# How long the status must hold before the redeploy counts as a success: Coolify
+# can report running:healthy while the new container is still starting.
+WATCH_STABLE_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -656,8 +659,14 @@ def watch_interval(elapsed: float, grace: float = WATCH_TRANSITION_GRACE_SECONDS
 async def wait_for_service(coolify_url: str, coolify_token: str, uuid: str,
                            baseline_status: str, container_name: str,
                            timeout: float = WATCH_TIMEOUT_SECONDS,
-                           grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> tuple[bool, str | None, str]:
+                           grace: float = WATCH_TRANSITION_GRACE_SECONDS,
+                           stable: float = WATCH_STABLE_SECONDS) -> tuple[bool, str | None, str]:
     """Follow a redeploy until the resource is back to its baseline status.
+
+    Back means the status held for WATCH_STABLE_SECONDS: Coolify reported
+    mealie running:healthy 2 s after its new container started, still at
+    health: starting in Docker (2026-09-24), and a version that crashes a few
+    seconds later must not count as a success.
 
     Returns (back, last status, note): back is False when the resource did not
     come back before the timeout; the note says when the restart was too quick
@@ -666,25 +675,33 @@ async def wait_for_service(coolify_url: str, coolify_token: str, uuid: str,
     deadline = time.time() + timeout
     started = time.time()
     transition_seen = False
+    back_since = None
     status = None
     last_logged = object()  # anything the first status cannot equal
 
     while True:
         status = await get_service_status(coolify_url, coolify_token, uuid)
+        now = time.time()
         if status != last_logged:
             logger.info(f"Watching {container_name} (service {uuid}): status={status}")
             last_logged = status
 
         if status is not None and status_is_at_least(status, baseline_status):
-            if transition_seen:
-                return True, status, ""
-            if time.time() - started >= grace:
-                # Coolify refreshes statuses on its own schedule; a restart that
-                # finished between two polls is invisible to us. That is the
-                # normal case for a service that comes back in a few seconds.
-                return True, status, f" {int(grace)} s after the redeploy (restart too quick to observe)"
-        elif status is not None:
-            transition_seen = True
+            if back_since is None:
+                back_since = now
+            if now - back_since >= stable:
+                if transition_seen:
+                    return True, status, ""
+                if now - started >= grace:
+                    # Coolify refreshes statuses on its own schedule; a restart
+                    # that finished between two polls is invisible to us. That
+                    # is the normal case for a service back in a few seconds.
+                    return True, status, f" {int(grace)} s after the redeploy (restart too quick to observe)"
+        else:
+            # An unreachable Coolify proves nothing either way: start over
+            back_since = None
+            if status is not None:
+                transition_seen = True
 
         if time.time() >= deadline:
             logger.warning(f"Gave up watching {container_name}: last status={status}")
