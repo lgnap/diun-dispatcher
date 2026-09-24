@@ -201,8 +201,6 @@ def log_environment_config():
     logger.info(f"IGNORE_CONTAINERS: {len(ignored_containers())} container(s) to ignore")
 
     # Check the series follow-up (diun-dispatcher.follow labels)
-    write_token = os.getenv("COOLIFY_WRITE_TOKEN", "").strip()
-    logger.info(f"COOLIFY_WRITE_TOKEN: {'✓ configured' if write_token else '✗ not configured (COOLIFY_TOKEN used)'}")
     logger.info(f"SERIES_CHECK_HOUR: series check every day at {series_check_hour()}:00")
 
     logger.info("=== End Configuration ===\n")
@@ -961,15 +959,6 @@ async def list_registry_tags(image: str) -> list[str] | None:
     return tags
 
 
-def get_write_token() -> str:
-    """The Coolify token allowed to read and rewrite composes.
-
-    Reading docker_compose_raw needs read:sensitive and rewriting it needs
-    write, which the deploy-only COOLIFY_TOKEN usually lacks.
-    """
-    return os.getenv("COOLIFY_WRITE_TOKEN", "").strip() or os.getenv("COOLIFY_TOKEN", "").strip()
-
-
 async def get_service(coolify_url: str, coolify_token: str, uuid: str) -> dict | None:
     """Read one Coolify service, or None if unreachable."""
     url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"
@@ -1073,19 +1062,18 @@ async def upgrade_resource(service: dict, service_name: str, target_tag: str) ->
 
 async def _apply_series_upgrade(service: dict, service_name: str, target_tag: str) -> str:
     coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
-    deploy_token = os.getenv("COOLIFY_TOKEN", "").strip()
-    write_token = get_write_token()
+    token = os.getenv("COOLIFY_TOKEN", "").strip()
     uuid = service.get("uuid", "")
     server = _server_name(service)
     urls = load_apprise_urls()
 
     # Work from the compose as saved right now, not from a listing that may be old
-    current = await get_service(coolify_url, write_token, uuid)
+    current = await get_service(coolify_url, token, uuid)
     original_raw = (current or {}).get("docker_compose_raw")
     entry = series_policies(original_raw).get(service_name)
     if not entry:
         logger.error(f"✗ Cannot read the compose of {service_name} (service {uuid}): "
-                     f"is COOLIFY_WRITE_TOKEN allowed to read sensitive data?")
+                     f"does COOLIFY_TOKEN have the read:sensitive permission?")
         send_notification(urls, f"❌ {service_name} — cannot upgrade to {target_tag}",
                           build_notification_body(server, target_tag, service_name,
                                                   "\n\n⚠️ Compose not readable: nothing was changed."))
@@ -1104,27 +1092,27 @@ async def _apply_series_upgrade(service: dict, service_name: str, target_tag: st
         return "failed"
 
     async def restore() -> bool:
-        return await patch_compose(coolify_url, write_token, uuid, original_raw)
+        return await patch_compose(coolify_url, token, uuid, original_raw)
 
     new_raw = rewrite_image_line(original_raw, service_name, new_image)
     if new_raw is None or not compose_matches(new_raw, original_raw, service_name, new_image):
         return fail("The image: line could not be rewritten: nothing was changed.", False)
 
     logger.info(f"Upgrading {service_name} (service {uuid}): {old_image} → {new_image}")
-    if not await patch_compose(coolify_url, write_token, uuid, new_raw):
+    if not await patch_compose(coolify_url, token, uuid, new_raw):
         # The save may still have gone through (a timeout): put the original back
         return fail("Coolify refused the new compose.", await restore())
 
-    saved = await get_service(coolify_url, write_token, uuid)
+    saved = await get_service(coolify_url, token, uuid)
     if not compose_matches((saved or {}).get("docker_compose_raw"), original_raw, service_name, new_image):
         logger.error(f"✗ The compose Coolify saved for {service_name} differs beyond the image line")
         return fail("The compose Coolify saved differs beyond the image: line.",
                     await restore())
 
-    if not (await trigger_coolify(coolify_url, deploy_token, uuid))["ok"]:
+    if not (await trigger_coolify(coolify_url, token, uuid))["ok"]:
         return fail("Coolify refused the redeploy.", await restore())
 
-    back, status, note = await wait_for_service(coolify_url, deploy_token, uuid,
+    back, status, note = await wait_for_service(coolify_url, token, uuid,
                                                 baseline_status, service_name)
     if back:
         send_notification(urls, f"✅ {service_name} {change} applied",
@@ -1135,7 +1123,7 @@ async def _apply_series_upgrade(service: dict, service_name: str, target_tag: st
     restored = await restore()
     if restored:
         # Bring the previous version back up
-        await trigger_coolify(coolify_url, deploy_token, uuid)
+        await trigger_coolify(coolify_url, token, uuid)
     return fail(f"The service never came back (last status: {status}).", restored)
 
 
@@ -1172,14 +1160,14 @@ async def check_series(service: dict, service_name: str, policy: str, image: str
 async def run_series_check() -> None:
     """One pass over every Coolify resource carrying a series label."""
     coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
-    token = get_write_token()
+    token = os.getenv("COOLIFY_TOKEN", "").strip()
     if not coolify_url or not token:
         logger.warning("Series check skipped: Coolify not configured")
         return
     services = await get_coolify_applications(coolify_url, token)
     if services and not any(s.get("docker_compose_raw") for s in services):
         logger.warning("Series check: Coolify hides every compose, "
-                       "COOLIFY_WRITE_TOKEN needs the read:sensitive permission")
+                       "COOLIFY_TOKEN needs the read:sensitive permission")
         return
     for service in services:
         uuid = service.get("uuid", "")
@@ -1196,7 +1184,7 @@ async def run_series_check() -> None:
 async def find_series_entry(coolify_url: str, service: dict, image: str) -> tuple[dict, str, dict] | None:
     """The labelled compose service of this Coolify service that runs the image:
     (service with its compose, compose service name, {policy, image})."""
-    full = await get_service(coolify_url, get_write_token(), service.get("uuid", ""))
+    full = await get_service(coolify_url, os.getenv("COOLIFY_TOKEN", "").strip(), service.get("uuid", ""))
     if not full:
         return None
     merged = {**service, **full}
@@ -1467,10 +1455,11 @@ async def manual_upgrade(request: Request, uuid: str, service: str, tag: str, se
             raise HTTPException(status_code=404, detail="UUID not found in cache (may be expired)")
 
     coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
-    if not coolify_url or not get_write_token():
+    token = os.getenv("COOLIFY_TOKEN", "").strip()
+    if not coolify_url or not token:
         raise HTTPException(status_code=500, detail="Coolify not configured")
 
-    coolify_service = await get_service(coolify_url, get_write_token(), resolved_uuid)
+    coolify_service = await get_service(coolify_url, token, resolved_uuid)
     entry = series_policies((coolify_service or {}).get("docker_compose_raw")).get(service)
     if not entry:
         raise HTTPException(status_code=404, detail=f"No {SERIES_LABEL} label on {service}")
