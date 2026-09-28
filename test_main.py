@@ -1541,3 +1541,19 @@ def test_upgrade_link_applies_an_announced_tag():
         resp = client.get("/upgrade?uuid=lychee-svc-uuid&service=lychee&tag=v6.10.4&secret=s3cret")
     assert resp.status_code == 200
     upgrade.assert_called_once()
+
+
+def test_lifespan_loads_the_cache_starts_the_series_check_and_saves_on_exit():
+    """Starlette 1.0 removed on_event: startup and shutdown go through the lifespan."""
+    import main
+    with patch("main._load_cache_from_disk") as load, \
+         patch("main._save_cache_to_disk") as save, \
+         patch("main.log_environment_config"), \
+         patch("main.series_check_loop", new=AsyncMock()) as loop:
+        with TestClient(app) as c:
+            load.assert_called_once()
+            save.assert_not_called()
+            assert c.get("/health").status_code == 200
+        save.assert_called_once()
+    loop.assert_called_once()
+    assert main._series_task is not None
