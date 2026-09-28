@@ -9,6 +9,7 @@ import apprise
 import httpx
 import time
 import yaml
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
@@ -36,7 +37,15 @@ class SecretQueryFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(SecretQueryFilter())
 
-app = FastAPI(title="Diun Webhook Dispatcher")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Starlette 1.0 removed on_event: startup and shutdown run here."""
+    await startup_event()
+    yield
+    await shutdown_event()
+
+
+app = FastAPI(title="Diun Webhook Dispatcher", lifespan=lifespan)
 
 # Templates
 templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
@@ -580,7 +589,6 @@ def extract_deployments_from_services(services: list[dict]) -> list[dict]:
 # Startup/Shutdown events
 # ---------------------------------------------------------------------------
 
-@app.on_event("startup")
 async def startup_event():
     """Initialize cache and log configuration on application startup"""
     global _series_task
@@ -589,7 +597,6 @@ async def startup_event():
     _series_task = asyncio.create_task(series_check_loop())
 
 
-@app.on_event("shutdown")
 async def shutdown_event():
     """Save cache to disk on application shutdown"""
     _save_cache_to_disk()
@@ -1455,8 +1462,7 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
         else:
             logger.warning(f"✗ Deployment failed: {deployment_info}")
 
-    return templates.TemplateResponse("deploy_confirmation.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "deploy_confirmation.html", {
         "deployed": deployed,
         "container_name": container_name,
         "image": image,
@@ -1502,8 +1508,7 @@ async def manual_upgrade(request: Request, uuid: str, service: str, tag: str, se
     blocked = series_upgrade_blocked(f"{resolved_uuid}/{service}")
     if not blocked:
         spawn(upgrade_resource(coolify_service, service, tag))
-    return templates.TemplateResponse("deploy_confirmation.html", {
-        "request": request,
+    return templates.TemplateResponse(request, "deploy_confirmation.html", {
         "deployed": blocked is None,
         "container_name": f"{service} ({blocked or 'upgrade started'})",
         "image": with_tag(entry["image"], tag),
