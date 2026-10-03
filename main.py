@@ -329,38 +329,39 @@ def normalize_image(image: str) -> str:
     return f"{registry}/{repository}" if registry else repository
 
 
-def find_service_by_image(services: list[dict], image: str) -> dict | None:
+def find_service_by_image(services: list[dict], image: str, container_name: str = "") -> dict | None:
     """Find the Coolify service whose application/database matches the image.
 
     Returns the full service dict so callers can read both its uuid and its
     server name (Coolify knows which server each resource runs on).
+
+    Images are matched by repository, so several services can match: a prod on
+    :latest and a staging on :staging of the same image. The service running the
+    container comes first (Coolify names containers <name>-<service uuid>), then
+    one configured with the same tag, then the first match.
     """
-    # Normalize the incoming image
     image_normalized = normalize_image(image)
-
+    candidates = []
     for service in services:
-        # Check applications within the service
-        for app in service.get("applications", []):
-            app_image = app.get("image", "")
-            if not app_image:
-                continue
+        resources = service.get("applications", []) + service.get("databases", [])
+        configured = [r.get("image", "") for r in resources
+                      if r.get("image") and normalize_image(r["image"]) == image_normalized]
+        if configured:
+            candidates.append((service, configured))
 
-            if normalize_image(app_image) == image_normalized:
-                logger.info(f"Found matching service uuid={service.get('uuid')} for image={image}")
-                return service
+    if not candidates:
+        logger.warning(f"No application found for image={image}")
+        return None
 
-        # Also check databases within the service
-        for db in service.get("databases", []):
-            db_image = db.get("image", "")
-            if not db_image:
-                continue
-
-            if normalize_image(db_image) == image_normalized:
-                logger.info(f"Found matching service uuid={service.get('uuid')} for image={image}")
-                return service
-
-    logger.warning(f"No application found for image={image}")
-    return None
+    names = [name.strip() for name in container_name.split(",") if name.strip()]
+    by_container = [service for service, _ in candidates
+                    if service.get("uuid") and any(name.endswith(f"-{service['uuid']}") for name in names)]
+    same_tag = [service for service, configured in candidates
+                if any(image_tag(ref) == image_tag(image) for ref in configured)]
+    service = (by_container or same_tag or [candidates[0][0]])[0]
+    logger.info(f"Found matching service uuid={service.get('uuid')} for image={image}"
+                + (f" ({len(candidates)} services pull this repository)" if len(candidates) > 1 else ""))
+    return service
 
 
 def image_tag(image: str) -> str:
@@ -1320,7 +1321,7 @@ async def diun_webhook(request: Request):
     deploy_link = ""
     if coolify_url and coolify_token:
         services = await get_coolify_applications(coolify_url, coolify_token)
-        matched_service = find_service_by_image(services, image)
+        matched_service = find_service_by_image(services, image, container_name)
         uuid = matched_service.get("uuid") if matched_service else None
         if uuid:
             deploy_link = build_deploy_link(uuid)

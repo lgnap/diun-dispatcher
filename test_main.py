@@ -305,6 +305,42 @@ def test_find_service_by_image_exposes_server_name():
     assert service["server"]["name"] == "server2-prod"
 
 
+# Two services pulling the same repository with different tags (prod :latest,
+# staging :staging): the event must reach the one running the container.
+STAGING_AND_PROD = [
+    {"uuid": "svc000000000000000000001", "server": {"name": "server1"},
+     "applications": [{"name": "nginx", "image": "registry.example.com/namour/mmss-nginx:staging"}], "databases": []},
+    {"uuid": "svc000000000000000000002", "server": {"name": "server1"},
+     "applications": [{"name": "nginx", "image": "registry.example.com/namour/mmss-nginx:latest"}], "databases": []},
+]
+
+
+def test_find_service_by_image_prefers_the_service_running_the_container():
+    service = find_service_by_image(STAGING_AND_PROD, "registry.example.com/namour/mmss-nginx:latest",
+                                    container_name="nginx-svc000000000000000000002")
+    assert service["uuid"] == "svc000000000000000000002"
+
+
+def test_find_service_by_image_reads_every_container_name():
+    """Diun joins the names of a container with commas."""
+    service = find_service_by_image(STAGING_AND_PROD, "registry.example.com/namour/mmss-nginx:staging",
+                                    container_name="other, nginx-svc000000000000000000001")
+    assert service["uuid"] == "svc000000000000000000001"
+
+
+def test_find_service_by_image_without_container_prefers_the_same_tag():
+    service = find_service_by_image(STAGING_AND_PROD, "registry.example.com/namour/mmss-nginx:latest")
+    assert service["uuid"] == "svc000000000000000000002"
+
+
+def test_find_service_by_image_falls_back_to_the_repository():
+    """watch_repo: another tag of the repository still finds the service (and is
+    then left alone because its tag is not the one in service)."""
+    service = find_service_by_image(STAGING_AND_PROD[:1], "registry.example.com/namour/mmss-nginx:1.2",
+                                    container_name="unknown")
+    assert service["uuid"] == "svc000000000000000000001"
+
+
 @patch('main.send_notification')
 @patch('main.get_coolify_applications')
 def test_webhook_uses_coolify_server_name(mock_coolify, mock_notify):
@@ -1557,3 +1593,23 @@ def test_lifespan_loads_the_cache_starts_the_series_check_and_saves_on_exit():
         save.assert_called_once()
     loop.assert_called_once()
     assert main._series_task is not None
+
+
+@patch('main.watch_deployment')
+@patch('main.send_notification')
+@patch('main.trigger_coolify')
+@patch('main.get_coolify_applications')
+def test_update_reaches_prod_when_staging_pulls_the_same_repository(mock_coolify, mock_trigger, mock_notify, mock_watch):
+    """2026-10-03: the prod :latest update matched the staging service first and
+    was dropped as "another tag"; prod was never redeployed."""
+    mock_coolify.return_value = STAGING_AND_PROD
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+    event = {**DIUN_PAYLOAD, "image": "registry.example.com/namour/mmss-nginx:latest",
+             "metadata": {**DIUN_PAYLOAD.get("metadata", {}), "ctn_names": "nginx-svc000000000000000000002"}}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.post("/webhook", json=event, headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.json()["action"] == "auto-deploy"
+    assert resp.json()["uuid"] == "svc000000000000000000002"
+    assert mock_trigger.call_args.args[2] == "svc000000000000000000002"
