@@ -1983,3 +1983,43 @@ def test_event_without_rebuild_metadata_keeps_the_service_path():
 
     assert resp.status_code == 200
     mocks["get_coolify_applications"].assert_awaited()
+
+
+# --- base image rebuild: review fixes ---------------------------------------
+
+def test_rebuild_applications_reports_an_unexpected_error():
+    results, m = None, None
+    import asyncio
+    import main
+    mocks = {
+        "deploy_application": AsyncMock(side_effect=RuntimeError("boom")),
+        "get_application_names": AsyncMock(return_value={"stg": "roadbook-staging"}),
+        "send_notification": MagicMock(),
+        "load_apprise_urls": MagicMock(return_value=["json://x"]),
+    }
+    with patch.multiple("main", **mocks):
+        with pytest.raises(RuntimeError):
+            asyncio.run(main.rebuild_applications(
+                "http://coolify", "token", "docker.io/serversideup/php:8.4-fpm-nginx",
+                "v4.5.2-1", ["stg", "acc"]))
+    mocks["send_notification"].assert_called_once()
+    title, body = mocks["send_notification"].call_args.args[1], mocks["send_notification"].call_args.args[2]
+    assert "❌" in title and "interrupted" in title
+    assert "boom" in body and "acc" in body
+
+
+def test_base_rebuild_lock_is_per_tag():
+    import main
+    assert main.base_rebuild_lock("docker.io/serversideup/php:8.4-fpm-nginx") is \
+        main.base_rebuild_lock("serversideup/php:8.4-fpm-nginx")
+    assert main.base_rebuild_lock("serversideup/php:8.4-fpm-nginx") is not \
+        main.base_rebuild_lock("serversideup/php:8.4-cli")
+
+
+def test_base_event_refused_without_webhook_secret():
+    env = {k: v for k, v in BASE_ENV.items() if k != "WEBHOOK_SECRET"}
+    resp, m = _post_base(_base_payload(), env=env)
+
+    assert resp.json()["action"] == "base-refused"
+    m["fetch_image_version"].assert_not_awaited()
+    m["rebuild_applications"].assert_not_called()

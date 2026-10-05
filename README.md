@@ -316,7 +316,13 @@ On an `update` of that image, the dispatcher:
 4. sends one notification with the outcome of each application.
 
 `new` events (first sighting of the entry) rebuild nothing. One run per base at
-a time. Coolify's `dockercompose` build pack always builds with `--pull`, so a
+a time.
+
+**One entry per base image**, listing every application built on it, in order:
+a failure stops all the applications after it, whatever their project. A
+second entry for the same image would not rebuild anything more. Base events
+are refused when `WEBHOOK_SECRET` is not set, since the payload names the
+applications to deploy. Coolify's `dockercompose` build pack always builds with `--pull`, so a
 plain deployment picks up the new base.
 
 ## API endpoints

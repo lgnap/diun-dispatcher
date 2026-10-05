@@ -1074,8 +1074,9 @@ _base_rebuild_locks: dict[str, asyncio.Lock] = {}
 
 
 def base_rebuild_lock(image: str) -> asyncio.Lock:
-    """One rebuild run per base image at a time."""
-    return _base_rebuild_locks.setdefault(normalize_image(image), asyncio.Lock())
+    """One rebuild run per base image (repository and tag) at a time."""
+    key = f"{normalize_image(image)}:{image_tag(image)}"
+    return _base_rebuild_locks.setdefault(key, asyncio.Lock())
 
 
 def _coolify_headers(coolify_token: str) -> dict:
@@ -1163,17 +1164,30 @@ async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
     async with lock:
         names = await get_application_names(coolify_url, coolify_token)
         results: list[tuple[str, str, str | None]] = []
-        for uuid in uuids:
-            if results and results[-1][1] != "finished":
-                results.append((uuid, "not deployed", None))
-                continue
-            deployment_uuid = await deploy_application(coolify_url, coolify_token, uuid)
-            if not deployment_uuid:
-                results.append((uuid, "refused", None))
-                continue
-            outcome = await wait_for_application_deployment(coolify_url, coolify_token, deployment_uuid)
-            logger.info(f"Rebuild of {names.get(uuid, uuid)} on {image}: {outcome}")
-            results.append((uuid, outcome, deployment_uuid))
+        try:
+            for uuid in uuids:
+                if results and results[-1][1] != "finished":
+                    results.append((uuid, "not deployed", None))
+                    continue
+                deployment_uuid = await deploy_application(coolify_url, coolify_token, uuid)
+                if not deployment_uuid:
+                    results.append((uuid, "refused", None))
+                    continue
+                outcome = await wait_for_application_deployment(coolify_url, coolify_token, deployment_uuid)
+                logger.info(f"Rebuild of {names.get(uuid, uuid)} on {image}: {outcome}")
+                results.append((uuid, outcome, deployment_uuid))
+        except BaseException as e:
+            # Diun will not send this event again: a run that dies (dispatcher
+            # restarted, unexpected error) must say where it stopped.
+            done = [f"• {names.get(u, u)}: {o}" for u, o, _ in results]
+            left = [f"• {names.get(u, u)}: not deployed" for u in uuids[len(results):]]
+            logger.error(f"✗ Rebuild on {image} interrupted: {type(e).__name__}: {e}")
+            send_notification(
+                load_apprise_urls(),
+                f"❌ Rebuild on {image_tag(image)} ({version}) interrupted",
+                f"🖼️ Base: {image}\n\n⚠️ {type(e).__name__}: {e}\n" + "\n".join(done + left),
+            )
+            raise
 
     lines = []
     for uuid, outcome, deployment_uuid in results:
@@ -1202,6 +1216,11 @@ def parse_rebuild_list(value) -> list[str]:
 async def handle_base_image_event(image: str, status: str, digest: str | None,
                                   metadata: dict, uuids: list[str]) -> JSONResponse:
     """A Diun event for a watched base image (file provider, metadata "rebuild")."""
+    # The payload names the applications to deploy: never from an unauthenticated caller
+    if not os.getenv("WEBHOOK_SECRET", "").strip():
+        logger.warning(f"Base {image}: WEBHOOK_SECRET is not set, base rebuilds are refused")
+        return JSONResponse({"ok": False, "action": "base-refused"})
+
     if status != "update":
         logger.info(f"Base {image}: status={status}, nothing to rebuild")
         return JSONResponse({"ok": True, "action": "base-ignored"})
