@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import httpx
 from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 from main import app, get_cloudflare_headers
@@ -1613,3 +1614,112 @@ def test_update_reaches_prod_when_staging_pulls_the_same_repository(mock_coolify
     assert resp.json()["action"] == "auto-deploy"
     assert resp.json()["uuid"] == "svc000000000000000000002"
     assert mock_trigger.call_args.args[2] == "svc000000000000000000002"
+
+
+# --- base image rebuild: version and series ---------------------------------
+
+import pytest
+
+
+@pytest.mark.parametrize("version,series,expected", [
+    ("v4.5.1-33486634677", "v4", True),
+    ("v4.6.0", "v4", True),
+    ("v5.0.0-beta3", "v4", False),
+    ("v5.0.0", "v4", False),
+    ("4.5.1", "v4", True),
+    (None, "v4", False),
+    ("", "v4", False),
+    ("v4.5.1", "", False),
+    ("v4.5.1", None, False),
+    ("latest", "v4", False),
+])
+def test_base_series_matches(version, series, expected):
+    from main import base_series_matches
+    assert base_series_matches(version, series) is expected
+
+
+def _manifest_response(body, status=200, headers=None):
+    request = httpx.Request("GET", "https://registry.test/v2/x/manifests/y")
+    return httpx.Response(status, json=body, headers=headers or {}, request=request)
+
+
+INDEX = {"manifests": [
+    {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}},
+    {"digest": "sha256:amd", "platform": {"os": "linux", "architecture": "amd64"}},
+]}
+MANIFEST = {"config": {"digest": "sha256:cfg"}}
+CONFIG = {"config": {"Labels": {"org.opencontainers.image.version": "v4.5.1-33486634677"}}}
+
+
+@patch("main.httpx.AsyncClient")
+def test_fetch_image_version_follows_index_manifest_and_config(mock_client_cls):
+    import asyncio
+    import main
+    challenge = {"WWW-Authenticate": 'Bearer realm="https://auth.docker.io/token",'
+                                     'service="registry.docker.io",scope="repository:serversideup/php:pull"'}
+    client_ = MagicMock()
+    client_.get = AsyncMock(side_effect=[
+        _manifest_response({}, 401, challenge),
+        _manifest_response({"token": "anon"}),
+        _manifest_response(INDEX),
+        _manifest_response(MANIFEST),
+        _manifest_response(CONFIG),
+    ])
+    mock_client_cls.return_value.__aenter__.return_value = client_
+
+    version = asyncio.run(main.fetch_image_version(
+        "docker.io/serversideup/php:8.4-fpm-nginx", "sha256:index"))
+
+    assert version == "v4.5.1-33486634677"
+    urls = [c.args[0] for c in client_.get.call_args_list]
+    assert urls[2] == "https://registry-1.docker.io/v2/serversideup/php/manifests/sha256:index"
+    assert urls[3] == "https://registry-1.docker.io/v2/serversideup/php/manifests/sha256:amd"
+    assert urls[4] == "https://registry-1.docker.io/v2/serversideup/php/blobs/sha256:cfg"
+    assert client_.get.call_args_list[2].kwargs["headers"]["Authorization"] == "Bearer anon"
+    assert "manifest.list" in client_.get.call_args_list[2].kwargs["headers"]["Accept"]
+
+
+@patch("main.httpx.AsyncClient")
+def test_fetch_image_version_reads_a_single_manifest(mock_client_cls):
+    import asyncio
+    import main
+    client_ = MagicMock()
+    client_.get = AsyncMock(side_effect=[_manifest_response(MANIFEST), _manifest_response(CONFIG)])
+    mock_client_cls.return_value.__aenter__.return_value = client_
+
+    version = asyncio.run(main.fetch_image_version("serversideup/php:8.4-fpm-nginx"))
+
+    assert version == "v4.5.1-33486634677"
+    assert client_.get.call_args_list[0].args[0] == \
+        "https://registry-1.docker.io/v2/serversideup/php/manifests/8.4-fpm-nginx"
+
+
+@patch("main.httpx.AsyncClient")
+def test_fetch_image_version_without_amd64_is_none(mock_client_cls):
+    import asyncio
+    import main
+    client_ = MagicMock()
+    client_.get = AsyncMock(side_effect=[_manifest_response({"manifests": [INDEX["manifests"][0]]})])
+    mock_client_cls.return_value.__aenter__.return_value = client_
+    assert asyncio.run(main.fetch_image_version("serversideup/php:8.4-fpm-nginx")) is None
+
+
+@patch("main.httpx.AsyncClient")
+def test_fetch_image_version_without_label_is_none(mock_client_cls):
+    import asyncio
+    import main
+    client_ = MagicMock()
+    client_.get = AsyncMock(side_effect=[_manifest_response(MANIFEST),
+                                         _manifest_response({"config": {"Labels": None}})])
+    mock_client_cls.return_value.__aenter__.return_value = client_
+    assert asyncio.run(main.fetch_image_version("serversideup/php:8.4-fpm-nginx")) is None
+
+
+@patch("main.httpx.AsyncClient")
+def test_fetch_image_version_on_registry_failure_is_none(mock_client_cls):
+    import asyncio
+    import main
+    client_ = MagicMock()
+    client_.get = AsyncMock(side_effect=RuntimeError("boom"))
+    mock_client_cls.return_value.__aenter__.return_value = client_
+    assert asyncio.run(main.fetch_image_version("serversideup/php:8.4-fpm-nginx")) is None

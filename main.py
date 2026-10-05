@@ -990,6 +990,83 @@ async def list_registry_tags(image: str) -> list[str] | None:
     return tags
 
 
+# ---------------------------------------------------------------------------
+# Base image rebuild: Coolify applications built on a watched base image
+# ---------------------------------------------------------------------------
+#
+# Applications built from a Dockerfile (roadbook, lametric…) are rebuilt only
+# on a push. Diun watches their base through its file provider, whose entry
+# carries in metadata the applications to rebuild and the major series they
+# run on. A republished base (PHP patches) rebuilds them; a base that moved to
+# another major (serversideup v4 -> v5) is only announced.
+
+BASE_VERSION_LABEL = "org.opencontainers.image.version"
+BASE_PLATFORM = ("linux", "amd64")
+MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+
+
+async def fetch_image_version(image: str, reference: str | None = None) -> str | None:
+    """The version label of an image (linux/amd64), or None if unreadable.
+
+    reference is the digest Diun reported, the image's tag otherwise. It may
+    point to an index (multi-platform) or straight to a manifest.
+    """
+    host, repository = registry_repository(image)
+    ref = reference or image_tag(image)
+    base_url = f"https://{host}/v2/{repository}"
+    auth: dict = {}
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            async def get(url: str, accept: str | None = None) -> httpx.Response:
+                nonlocal auth
+                extra = {"Accept": accept} if accept else {}
+                resp = await client.get(url, headers={**auth, **extra})
+                if resp.status_code == 401 and not auth:
+                    token = await _registry_token(client, resp.headers.get("WWW-Authenticate", ""))
+                    if not token:
+                        raise RuntimeError("no anonymous token offered")
+                    auth = {"Authorization": f"Bearer {token}"}
+                    resp = await client.get(url, headers={**auth, **extra})
+                resp.raise_for_status()
+                return resp
+
+            manifest = (await get(f"{base_url}/manifests/{ref}", MANIFEST_ACCEPT)).json()
+            if "manifests" in manifest:
+                digests = [m.get("digest") for m in manifest["manifests"]
+                           if (m.get("platform", {}).get("os"),
+                               m.get("platform", {}).get("architecture")) == BASE_PLATFORM]
+                if not digests:
+                    raise RuntimeError("no linux/amd64 image in the index")
+                manifest = (await get(f"{base_url}/manifests/{digests[0]}", MANIFEST_ACCEPT)).json()
+            config = (await get(f"{base_url}/blobs/{manifest['config']['digest']}")).json()
+    except Exception as e:
+        logger.error(f"✗ Could not read the version of {host}/{repository}@{ref}: {e}")
+        return None
+    labels = (config.get("config") or {}).get("Labels") or {}
+    version = labels.get(BASE_VERSION_LABEL)
+    logger.info(f"Registry {host}/{repository}@{ref}: version label {version!r}")
+    return version
+
+
+def base_series_matches(version: str | None, series: str | None) -> bool:
+    """True when the base version is in the major series the applications run.
+
+    Only the major is compared, with or without "v": "v4.5.1-33486634677" is in
+    "v4", "v5.0.0-beta3" is not. Anything unreadable is not a match: the caller
+    then announces instead of rebuilding.
+    """
+    got = parse_tag(version or "")
+    want = parse_tag(series or "")
+    if got is None or want is None:
+        return False
+    return got[1][:1] == want[1][:1]
+
+
 async def get_service(coolify_url: str, coolify_token: str, uuid: str) -> dict | None:
     """Read one Coolify service, or None if unreachable."""
     url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"
