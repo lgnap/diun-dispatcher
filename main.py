@@ -1067,6 +1067,129 @@ def base_series_matches(version: str | None, series: str | None) -> bool:
     return got[1][:1] == want[1][:1]
 
 
+APP_DEPLOY_TIMEOUT_SECONDS = 30 * 60
+APP_DEPLOY_TERMINAL = ("finished", "failed", "cancelled-by-user")
+
+_base_rebuild_locks: dict[str, asyncio.Lock] = {}
+
+
+def base_rebuild_lock(image: str) -> asyncio.Lock:
+    """One rebuild run per base image at a time."""
+    return _base_rebuild_locks.setdefault(normalize_image(image), asyncio.Lock())
+
+
+def _coolify_headers(coolify_token: str) -> dict:
+    return {"Authorization": f"Bearer {coolify_token}", **get_cloudflare_headers()}
+
+
+async def deploy_application(coolify_url: str, coolify_token: str, uuid: str) -> str | None:
+    """Queue a deployment of a Coolify application; its deployment uuid, or None.
+
+    For the dockercompose build pack, Coolify always builds with
+    "docker compose build --pull": a plain deployment pulls the new base.
+    """
+    url = f"{coolify_url.rstrip('/')}/api/v1/deploy"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, headers=_coolify_headers(coolify_token), params={"uuid": uuid})
+            resp.raise_for_status()
+    except Exception as e:
+        logger.error(f"✗ Coolify did not queue a deployment of application {uuid}: {e}")
+        return None
+    deployment_uuid = _extract_deployment_uuid(resp)
+    logger.info(f"✓ Deployment of application {uuid} queued: {deployment_uuid}")
+    return deployment_uuid
+
+
+async def get_deployment_status(coolify_url: str, coolify_token: str, deployment_uuid: str) -> str | None:
+    """A Coolify deployment's status (queued, in_progress, finished…), or None if unreachable."""
+    url = f"{coolify_url.rstrip('/')}/api/v1/deployments/{deployment_uuid}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=_coolify_headers(coolify_token))
+            resp.raise_for_status()
+            return resp.json().get("status")
+    except Exception as e:
+        logger.warning(f"Could not read deployment {deployment_uuid}: {e}")
+        return None
+
+
+async def wait_for_application_deployment(coolify_url: str, coolify_token: str, deployment_uuid: str,
+                                          timeout: float = APP_DEPLOY_TIMEOUT_SECONDS,
+                                          grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> str:
+    """Follow a deployment until a terminal status; "timeout" if none came in time.
+
+    An unreachable Coolify (None) proves nothing: keep waiting.
+    """
+    started = time.time()
+    last_logged = object()
+    while True:
+        status = await get_deployment_status(coolify_url, coolify_token, deployment_uuid)
+        if status != last_logged:
+            logger.info(f"Deployment {deployment_uuid}: status={status}")
+            last_logged = status
+        if status in APP_DEPLOY_TERMINAL:
+            return status
+        if time.time() - started >= timeout:
+            logger.warning(f"Gave up following deployment {deployment_uuid}: last status={status}")
+            return "timeout"
+        await asyncio.sleep(watch_interval(time.time() - started, grace))
+
+
+async def get_application_names(coolify_url: str, coolify_token: str) -> dict[str, str]:
+    """{uuid: name} of the Coolify applications, {} if Coolify cannot be read."""
+    url = f"{coolify_url.rstrip('/')}/api/v1/applications"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=_coolify_headers(coolify_token))
+            resp.raise_for_status()
+            return {a["uuid"]: a.get("name") or a["uuid"] for a in resp.json() if a.get("uuid")}
+    except Exception as e:
+        logger.warning(f"Could not list the Coolify applications: {e}")
+        return {}
+
+
+async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
+                               version: str, uuids: list[str]) -> list[tuple[str, str, str | None]]:
+    """Rebuild the applications built on a base, in order, stopping at the first failure.
+
+    Returns (uuid, outcome, deployment uuid) per application, [] when a run for
+    this base is already in progress (it already pulls the newest base).
+    """
+    lock = base_rebuild_lock(image)
+    if lock.locked():
+        logger.info(f"A rebuild on {image} is already running, this event is dropped")
+        return []
+    async with lock:
+        names = await get_application_names(coolify_url, coolify_token)
+        results: list[tuple[str, str, str | None]] = []
+        for uuid in uuids:
+            if results and results[-1][1] != "finished":
+                results.append((uuid, "not deployed", None))
+                continue
+            deployment_uuid = await deploy_application(coolify_url, coolify_token, uuid)
+            if not deployment_uuid:
+                results.append((uuid, "refused", None))
+                continue
+            outcome = await wait_for_application_deployment(coolify_url, coolify_token, deployment_uuid)
+            logger.info(f"Rebuild of {names.get(uuid, uuid)} on {image}: {outcome}")
+            results.append((uuid, outcome, deployment_uuid))
+
+    lines = []
+    for uuid, outcome, deployment_uuid in results:
+        line = f"• {names.get(uuid, uuid)}: {outcome}"
+        if outcome not in ("finished", "not deployed") and deployment_uuid:
+            line += f" (deployment {deployment_uuid})"
+        lines.append(line)
+    failed = next((r for r in results if r[1] != "finished"), None)
+    if failed is None:
+        title = f"✅ {len(results)} application(s) rebuilt on {image_tag(image)} ({version})"
+    else:
+        title = f"❌ Rebuild on {image_tag(image)} ({version}) stopped at {names.get(failed[0], failed[0])}"
+    send_notification(load_apprise_urls(), title, f"🖼️ Base: {image}\n\n" + "\n".join(lines))
+    return results
+
+
 async def get_service(coolify_url: str, coolify_token: str, uuid: str) -> dict | None:
     """Read one Coolify service, or None if unreachable."""
     url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"

@@ -1723,3 +1723,148 @@ def test_fetch_image_version_on_registry_failure_is_none(mock_client_cls):
     client_.get = AsyncMock(side_effect=RuntimeError("boom"))
     mock_client_cls.return_value.__aenter__.return_value = client_
     assert asyncio.run(main.fetch_image_version("serversideup/php:8.4-fpm-nginx")) is None
+
+
+# --- base image rebuild: deploying the applications ------------------------
+
+def _coolify_response(body, status=200, method="POST", url="http://coolify/api/v1/deploy"):
+    return httpx.Response(status, json=body, request=httpx.Request(method, url))
+
+
+@patch("main.httpx.AsyncClient")
+def test_deploy_application_posts_and_returns_the_deployment(mock_client_cls):
+    import asyncio
+    import main
+    client_ = MagicMock()
+    client_.post = AsyncMock(return_value=_coolify_response(
+        {"deployments": [{"message": "queued", "resource_uuid": "app-1", "deployment_uuid": "dep-1"}]}))
+    mock_client_cls.return_value.__aenter__.return_value = client_
+
+    dep = asyncio.run(main.deploy_application("http://coolify/", "token", "app-1"))
+
+    assert dep == "dep-1"
+    call = client_.post.call_args
+    assert call.args[0] == "http://coolify/api/v1/deploy"
+    assert call.kwargs["params"] == {"uuid": "app-1"}
+    assert call.kwargs["headers"]["Authorization"] == "Bearer token"
+
+
+@patch("main.httpx.AsyncClient")
+def test_deploy_application_refused_is_none(mock_client_cls):
+    import asyncio
+    import main
+    client_ = MagicMock()
+    client_.post = AsyncMock(return_value=_coolify_response({"message": "Unauthenticated."}, 401))
+    mock_client_cls.return_value.__aenter__.return_value = client_
+    assert asyncio.run(main.deploy_application("http://coolify", "token", "app-1")) is None
+
+
+def _wait(statuses, timeout=1800.0):
+    """Run wait_for_application_deployment against a scripted list of statuses."""
+    import asyncio
+    import main
+    clock = {"now": 1000.0}
+
+    async def fake_sleep(seconds):
+        clock["now"] += seconds
+
+    status = AsyncMock(side_effect=statuses)
+    with patch("main.get_deployment_status", new=status), \
+         patch("main.asyncio.sleep", new=fake_sleep), \
+         patch("main.time.time", new=lambda: clock["now"]):
+        outcome = asyncio.run(main.wait_for_application_deployment(
+            "http://coolify", "token", "dep-1", timeout=timeout))
+    return outcome, status
+
+
+def test_wait_for_application_deployment_ends_on_finished():
+    outcome, status = _wait(["queued", "in_progress", "in_progress", "finished"])
+    assert outcome == "finished"
+    assert status.await_count == 4
+
+
+def test_wait_for_application_deployment_ends_on_failed():
+    outcome, _ = _wait(["in_progress", "failed"])
+    assert outcome == "failed"
+
+
+def test_wait_for_application_deployment_survives_unreachable_coolify():
+    outcome, _ = _wait([None, None, "in_progress", "finished"])
+    assert outcome == "finished"
+
+
+def test_wait_for_application_deployment_times_out():
+    outcome, _ = _wait(["in_progress"] * 1000, timeout=120.0)
+    assert outcome == "timeout"
+
+
+def _rebuild(outcomes, deploys=None, names=None):
+    """Run rebuild_applications with scripted deploy results and outcomes."""
+    import asyncio
+    import main
+    uuids = ["stg", "acc", "prod"]
+    mocks = {
+        "deploy_application": AsyncMock(side_effect=deploys or [f"dep-{u}" for u in uuids]),
+        "wait_for_application_deployment": AsyncMock(side_effect=outcomes),
+        "get_application_names": AsyncMock(return_value=names if names is not None else
+                                           {"stg": "roadbook-staging", "acc": "roadbook-acc",
+                                            "prod": "roadbook-prod"}),
+        "send_notification": MagicMock(),
+        "load_apprise_urls": MagicMock(return_value=["json://x"]),
+    }
+    with patch.multiple("main", **mocks):
+        results = asyncio.run(main.rebuild_applications(
+            "http://coolify", "token", "docker.io/serversideup/php:8.4-fpm-nginx",
+            "v4.5.2-1", uuids))
+    return results, mocks
+
+
+def test_rebuild_applications_deploys_in_order_and_reports_success():
+    results, m = _rebuild(["finished", "finished", "finished"])
+
+    assert [r[:2] for r in results] == [("stg", "finished"), ("acc", "finished"), ("prod", "finished")]
+    assert [c.args[2] for c in m["deploy_application"].await_args_list] == ["stg", "acc", "prod"]
+    m["send_notification"].assert_called_once()
+    title, body = m["send_notification"].call_args.args[1], m["send_notification"].call_args.args[2]
+    assert "✅" in title and "v4.5.2-1" in title
+    assert "roadbook-prod: finished" in body
+
+
+def test_rebuild_applications_stops_at_the_first_failure():
+    results, m = _rebuild(["finished", "failed"])
+
+    assert [r[:2] for r in results] == [("stg", "finished"), ("acc", "failed"), ("prod", "not deployed")]
+    assert m["deploy_application"].await_count == 2
+    title, body = m["send_notification"].call_args.args[1], m["send_notification"].call_args.args[2]
+    assert "❌" in title and "roadbook-acc" in title
+    assert "dep-acc" in body
+    assert "roadbook-prod: not deployed" in body
+
+
+def test_rebuild_applications_stops_when_coolify_refuses_a_deploy():
+    results, m = _rebuild(["finished"], deploys=["dep-stg", None])
+
+    assert [r[:2] for r in results] == [("stg", "finished"), ("acc", "refused"), ("prod", "not deployed")]
+    assert m["wait_for_application_deployment"].await_count == 1
+
+
+def test_rebuild_applications_names_unknown_uuids_by_uuid():
+    _, m = _rebuild(["finished", "finished", "finished"], names={})
+    assert "stg: finished" in m["send_notification"].call_args.args[2]
+
+
+def test_rebuild_applications_runs_once_per_base():
+    import asyncio
+    import main
+
+    async def scenario():
+        lock = main.base_rebuild_lock("serversideup/php:8.4-fpm-nginx")
+        async with lock:
+            return await main.rebuild_applications(
+                "http://coolify", "token", "docker.io/serversideup/php:8.4-fpm-nginx",
+                "v4.5.2-1", ["stg"])
+
+    deploy = AsyncMock()
+    with patch("main.deploy_application", new=deploy):
+        assert asyncio.run(scenario()) == []
+    deploy.assert_not_awaited()
