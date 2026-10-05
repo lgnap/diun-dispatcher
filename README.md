@@ -287,6 +287,38 @@ alone: `include_tags` also applies to the tag in service, and the dispatcher rea
 the registry itself, so a correction in an older major is found even when Diun
 only follows the highest tag.
 
+## Base images: rebuild the applications built on them
+
+Coolify applications built from a Dockerfile (`FROM serversideup/php:8.4-fpm-nginx`)
+are only rebuilt on a push. To rebuild them when their base is republished,
+Diun watches the base through its **file provider**, and the entry names the
+applications in its metadata:
+
+```yaml
+# DIUN_PROVIDERS_FILE_FILENAME=/etc/diun/bases.yml
+- name: docker.io/serversideup/php:8.4-fpm-nginx
+  notify_on: update
+  metadata:
+    rebuild: <staging uuid>,<acc uuid>,<prod uuid>
+    rebuild_series: v4
+```
+
+On an `update` of that image, the dispatcher:
+
+1. reads the image's `org.opencontainers.image.version` label (linux/amd64) from
+   the registry;
+2. if its major differs from `rebuild_series` (or cannot be read), **announces
+   only**: a base that moved to a new major is a planned upgrade, never an
+   automatic one;
+3. otherwise, with `AUTO_DEPLOY` on, deploys the applications **one at a time,
+   in the listed order** (`POST /api/v1/deploy`), follows each deployment, and
+   stops at the first one that does not finish: list staging before prod;
+4. sends one notification with the outcome of each application.
+
+`new` events (first sighting of the entry) rebuild nothing. One run per base at
+a time. Coolify's `dockercompose` build pack always builds with `--pull`, so a
+plain deployment picks up the new base.
+
 ## API endpoints
 
 ### POST `/webhook`

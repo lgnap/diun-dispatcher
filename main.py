@@ -1190,6 +1190,62 @@ async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
     return results
 
 
+BASE_REBUILD_KEY = "rebuild"
+BASE_SERIES_KEY = "rebuild_series"
+
+
+def parse_rebuild_list(value) -> list[str]:
+    """The application uuids of a Diun metadata value: "a, b,c," -> ["a", "b", "c"]."""
+    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+
+
+async def handle_base_image_event(image: str, status: str, digest: str | None,
+                                  metadata: dict, uuids: list[str]) -> JSONResponse:
+    """A Diun event for a watched base image (file provider, metadata "rebuild")."""
+    if status != "update":
+        logger.info(f"Base {image}: status={status}, nothing to rebuild")
+        return JSONResponse({"ok": True, "action": "base-ignored"})
+
+    series = str(metadata.get(BASE_SERIES_KEY) or "").strip()
+    version = await fetch_image_version(image, digest)
+    apprise_urls = load_apprise_urls()
+    listed = "\n".join(f"• {uuid}" for uuid in uuids)
+
+    if not base_series_matches(version, series):
+        logger.warning(f"Base {image} is at {version!r}, outside series {series!r}: announce only")
+        send_notification(
+            apprise_urls,
+            f"⚠️ {image_tag(image)} — base now {version or 'unknown'}, outside series {series or '?'}",
+            f"🖼️ Base: {image}\n\nℹ️ Nothing rebuilt: {len(uuids)} application(s) stay on "
+            f"their last build. Plan the upgrade, then update rebuild_series in Diun's "
+            f"bases.yml.\n{listed}",
+        )
+        return JSONResponse({"ok": True, "action": "base-announced", "version": version})
+
+    if not is_auto_deploy_enabled():
+        send_notification(
+            apprise_urls,
+            f"⬆️ {image_tag(image)} — base updated ({version})",
+            f"🖼️ Base: {image}\n\nℹ️ AUTO_DEPLOY is off: redeploy these applications in "
+            f"Coolify, staging first.\n{listed}",
+        )
+        return JSONResponse({"ok": True, "action": "base-notified", "version": version})
+
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+    if not coolify_url or not coolify_token:
+        logger.warning("COOLIFY_API_URL or COOLIFY_TOKEN not configured, base rebuild skipped")
+        return JSONResponse({"ok": True, "action": "base-no-coolify"})
+
+    if base_rebuild_lock(image).locked():
+        logger.info(f"A rebuild on {image} is already running, this event is dropped")
+        return JSONResponse({"ok": True, "action": "base-busy"})
+
+    logger.info(f"Base {image} updated to {version}: rebuilding {', '.join(uuids)}")
+    spawn(rebuild_applications(coolify_url, coolify_token, image, version, uuids))
+    return JSONResponse({"ok": True, "action": "base-rebuild", "version": version})
+
+
 async def get_service(coolify_url: str, coolify_token: str, uuid: str) -> dict | None:
     """Read one Coolify service, or None if unreachable."""
     url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"
@@ -1499,6 +1555,12 @@ async def diun_webhook(request: Request):
     image = data.get("image", "unknown")
     metadata = data.get("metadata", {})
     container_name = metadata.get("ctn_names", "unknown")
+
+    # A base image watched by Diun's file provider: rebuild what is built on it
+    rebuild = parse_rebuild_list(metadata.get(BASE_REBUILD_KEY))
+    if rebuild:
+        logger.info(f"Base image event: image={image} status={status} rebuild={rebuild}")
+        return await handle_base_image_event(image, status, data.get("digest"), metadata, rebuild)
 
     logger.info(f"Event: hostname={hostname} container={container_name} image={image} status={status}")
 

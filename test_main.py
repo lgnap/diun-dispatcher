@@ -1868,3 +1868,118 @@ def test_rebuild_applications_runs_once_per_base():
     with patch("main.deploy_application", new=deploy):
         assert asyncio.run(scenario()) == []
     deploy.assert_not_awaited()
+
+
+# --- base image rebuild: webhook routing -----------------------------------
+
+BASE_ENV = {
+    "COOLIFY_API_URL": "http://coolify",
+    "COOLIFY_TOKEN": "token",
+    "AUTO_DEPLOY": "true",
+    "WEBHOOK_SECRET": "s3cret",
+    "APPRISE_URLS": "json://x",
+}
+
+
+def _base_payload(status="update", rebuild="stg, acc,prod,", series="v4"):
+    return {
+        "hostname": "server2", "status": status, "provider": "file",
+        "image": "docker.io/serversideup/php:8.4-fpm-nginx",
+        "digest": "sha256:index", "platform": "linux/amd64",
+        "metadata": {"rebuild": rebuild, "rebuild_series": series},
+    }
+
+
+def _post_base(payload, env=BASE_ENV, version="v4.5.2-1"):
+    mocks = {
+        "fetch_image_version": AsyncMock(return_value=version),
+        "rebuild_applications": AsyncMock(return_value=[]),
+        "send_notification": MagicMock(),
+        "get_coolify_applications": AsyncMock(side_effect=AssertionError("no service matching")),
+    }
+    with patch.dict(os.environ, env, clear=True), patch.multiple("main", **mocks):
+        resp = client.post("/webhook", json=payload, headers={"X-Diun-Secret": "s3cret"})
+    return resp, mocks
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("stg, acc,prod,", ["stg", "acc", "prod"]),
+    ("", []),
+    (None, []),
+    (" , ", []),
+    ("only", ["only"]),
+])
+def test_parse_rebuild_list(value, expected):
+    from main import parse_rebuild_list
+    assert parse_rebuild_list(value) == expected
+
+
+def test_base_update_in_series_rebuilds_in_order():
+    resp, m = _post_base(_base_payload())
+
+    assert resp.json()["action"] == "base-rebuild"
+    m["fetch_image_version"].assert_awaited_once_with(
+        "docker.io/serversideup/php:8.4-fpm-nginx", "sha256:index")
+    m["rebuild_applications"].assert_called_once()
+    args = m["rebuild_applications"].call_args.args
+    assert args[1:] == ("token", "docker.io/serversideup/php:8.4-fpm-nginx", "v4.5.2-1",
+                        ["stg", "acc", "prod"])
+    m["send_notification"].assert_not_called()
+
+
+def test_base_new_is_ignored():
+    resp, m = _post_base(_base_payload(status="new"))
+
+    assert resp.json()["action"] == "base-ignored"
+    m["fetch_image_version"].assert_not_awaited()
+    m["rebuild_applications"].assert_not_called()
+
+
+def test_base_in_another_major_is_only_announced():
+    resp, m = _post_base(_base_payload(), version="v5.0.0")
+
+    assert resp.json()["action"] == "base-announced"
+    m["rebuild_applications"].assert_not_called()
+    title, body = m["send_notification"].call_args.args[1], m["send_notification"].call_args.args[2]
+    assert "v5.0.0" in title and "v4" in title
+    assert "3 application(s)" in body
+
+
+def test_base_with_unreadable_version_is_only_announced():
+    resp, m = _post_base(_base_payload(), version=None)
+
+    assert resp.json()["action"] == "base-announced"
+    m["rebuild_applications"].assert_not_called()
+    assert "unknown" in m["send_notification"].call_args.args[1]
+
+
+def test_base_without_auto_deploy_only_notifies():
+    env = {k: v for k, v in BASE_ENV.items() if k != "AUTO_DEPLOY"}
+    resp, m = _post_base(_base_payload(), env=env)
+
+    assert resp.json()["action"] == "base-notified"
+    m["rebuild_applications"].assert_not_called()
+    assert "stg" in m["send_notification"].call_args.args[2]
+
+
+def test_base_rebuild_already_running_is_dropped():
+    import main
+    lock = main.base_rebuild_lock("serversideup/php:8.4-fpm-nginx")
+    with patch.object(lock, "locked", return_value=True):
+        resp, m = _post_base(_base_payload())
+
+    assert resp.json()["action"] == "base-busy"
+    m["rebuild_applications"].assert_not_called()
+
+
+def test_event_without_rebuild_metadata_keeps_the_service_path():
+    payload = _base_payload(rebuild="")
+    payload["metadata"]["ctn_names"] = "nextcloud"
+    mocks = {"get_coolify_applications": AsyncMock(return_value=[]),
+             "send_notification": MagicMock(),
+             "fetch_image_version": AsyncMock(side_effect=AssertionError("not a base event"))}
+    with patch.dict(os.environ, BASE_ENV, clear=True), patch.multiple("main", **mocks):
+        resp = client.post("/webhook", json=payload, headers={"X-Diun-Secret": "s3cret"})
+
+    assert resp.status_code == 200
+    mocks["get_coolify_applications"].assert_awaited()
