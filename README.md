@@ -297,7 +297,8 @@ applications in its metadata:
 ```yaml
 # DIUN_PROVIDERS_FILE_FILENAME=/etc/diun/bases.yml
 - name: docker.io/serversideup/php:8.4-fpm-nginx
-  notify_on: update
+  notify_on:
+    - update
   metadata:
     rebuild: <staging uuid>,<acc uuid>,<prod uuid>
     rebuild_series: v4
