@@ -110,7 +110,9 @@ def test_deploy_success(mock_trigger, mock_coolify):
         from main import cache_uuid
         cache_uuid("full-uui", "full-uuid-12345")
 
-        response = client.get("/deploy?uuid=full-uui&secret=test-secret")
+        # The background wait for the service is covered by its own tests
+        with patch("main.spawn", new=lambda coro: coro.close()):
+            response = client.get("/deploy?uuid=full-uui&secret=test-secret")
         assert response.status_code == 200
         assert "Deployment Status" in response.text
 
@@ -495,18 +497,17 @@ def test_auto_deploy_treats_other_values_as_disabled():
             assert is_auto_deploy_enabled() is False, value
 
 
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
 @patch('main.watch_deployment')
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
-def test_webhook_triggers_deploy_when_auto_deploy_enabled(mock_coolify, mock_trigger, mock_notify, mock_watch):
+def test_webhook_triggers_deploy_when_auto_deploy_enabled(mock_coolify, mock_trigger, mock_notify, mock_watch, mock_status):
     """With AUTO_DEPLOY on, a matched image is redeployed without waiting for a click."""
     mock_coolify.return_value = [MATCHING_SERVICE]
     mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
 
-    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
-        resp = client.post("/webhook", json=DIUN_PAYLOAD,
-                           headers={"X-Diun-Secret": "s3cret"})
+    resp, = _post_webhooks([DIUN_PAYLOAD])
 
     assert resp.status_code == 200
     assert mock_trigger.call_args.args[2] == "svc-1"
@@ -527,16 +528,16 @@ def test_webhook_stays_silent_until_deployment_finishes(mock_coolify, mock_trigg
     mock_notify.assert_not_called()
 
 
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
-def test_webhook_notifies_with_manual_link_when_trigger_fails(mock_coolify, mock_trigger, mock_notify):
+def test_webhook_notifies_with_manual_link_when_trigger_fails(mock_coolify, mock_trigger, mock_notify, mock_status):
     """If Coolify refuses the deploy, the user is told and gets the manual link."""
     mock_coolify.return_value = [MATCHING_SERVICE]
     mock_trigger.return_value = {"ok": False, "deployment_uuid": None}
 
-    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
-        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+    _post_webhooks([DIUN_PAYLOAD])
 
     mock_notify.assert_called_once()
     title = mock_notify.call_args.args[1]
@@ -852,18 +853,18 @@ def test_watch_survives_an_unreachable_coolify(mock_notify):
     assert "⏱️" in mock_notify.call_args.args[1]
 
 
+@patch("main.get_service_status", new_callable=AsyncMock, return_value=None)
 @patch('main.watch_deployment')
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
 def test_auto_deploy_watches_the_service_it_restarted(mock_coolify, mock_trigger,
-                                                      mock_notify, mock_watch):
-    """The baseline status is read from the service listing we already fetched."""
+                                                      mock_notify, mock_watch, mock_status):
+    """Without a fresher status, the baseline is the one of the service listing."""
     mock_coolify.return_value = [MATCHING_SERVICE]
     mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
 
-    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
-        client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+    _post_webhooks([DIUN_PAYLOAD])
 
     mock_notify.assert_not_called()
     mock_watch.assert_called_once()
@@ -1001,19 +1002,19 @@ def test_new_event_without_matching_resource_is_not_announced(mock_coolify, mock
     mock_notify.assert_not_called()
 
 
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
 @patch('main.watch_deployment')
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
-def test_update_event_still_auto_deploys(mock_coolify, mock_trigger, mock_notify, mock_watch):
+def test_update_event_still_auto_deploys(mock_coolify, mock_trigger, mock_notify, mock_watch, mock_status):
     """An "update" (the tag in service was republished) keeps deploying by itself."""
     mock_coolify.return_value = [MATCHING_SERVICE]
     mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
 
-    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
-        resp = client.post("/webhook", json=DIUN_PAYLOAD, headers={"X-Diun-Secret": "s3cret"})
+    resp, = _post_webhooks([DIUN_PAYLOAD])
 
-    assert resp.json()["action"] == "auto-deploy"
+    assert resp.json()["action"] == "auto-deploy-scheduled"
     mock_trigger.assert_called_once()
 
 
@@ -1596,11 +1597,12 @@ def test_lifespan_loads_the_cache_starts_the_series_check_and_saves_on_exit():
     assert main._series_task is not None
 
 
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
 @patch('main.watch_deployment')
 @patch('main.send_notification')
 @patch('main.trigger_coolify')
 @patch('main.get_coolify_applications')
-def test_update_reaches_prod_when_staging_pulls_the_same_repository(mock_coolify, mock_trigger, mock_notify, mock_watch):
+def test_update_reaches_prod_when_staging_pulls_the_same_repository(mock_coolify, mock_trigger, mock_notify, mock_watch, mock_status):
     """2026-10-03: the prod :latest update matched the staging service first and
     was dropped as "another tag"; prod was never redeployed."""
     mock_coolify.return_value = STAGING_AND_PROD
@@ -1608,10 +1610,9 @@ def test_update_reaches_prod_when_staging_pulls_the_same_repository(mock_coolify
     event = {**DIUN_PAYLOAD, "image": "registry.example.com/namour/mmss-nginx:latest",
              "metadata": {**DIUN_PAYLOAD.get("metadata", {}), "ctn_names": "nginx-svc000000000000000000002"}}
 
-    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
-        resp = client.post("/webhook", json=event, headers={"X-Diun-Secret": "s3cret"})
+    resp, = _post_webhooks([event])
 
-    assert resp.json()["action"] == "auto-deploy"
+    assert resp.json()["action"] == "auto-deploy-scheduled"
     assert resp.json()["uuid"] == "svc000000000000000000002"
     assert mock_trigger.call_args.args[2] == "svc000000000000000000002"
 
@@ -2023,3 +2024,435 @@ def test_base_event_refused_without_webhook_secret():
     assert resp.json()["action"] == "base-refused"
     m["fetch_image_version"].assert_not_awaited()
     m["rebuild_applications"].assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# One restart at a time per Coolify service
+#
+# 2026-10-05: two images of the same service were updated in the same Diun
+# pass; two webhooks restarted the service twice at once, and the two
+# overlapping "compose up" left two database containers on one data directory.
+# ---------------------------------------------------------------------------
+
+NO_DEBOUNCE_ENV = {**AUTO_DEPLOY_ENV, "DEPLOY_DEBOUNCE_SECONDS": "0"}
+
+
+def _reset_redeploy_state():
+    import main
+    main._pending_redeploys.clear()
+    main._service_restart_locks.clear()
+    main._last_restart_request.clear()
+
+
+def _post_webhooks(events, env=NO_DEBOUNCE_ENV):
+    """Post the events, then run the background redeploys they scheduled, together."""
+    import asyncio
+    _reset_redeploy_state()
+    spawned = []
+    with patch.dict(os.environ, env, clear=True), \
+         patch("main.spawn", new=lambda coro: spawned.append(coro)):
+        responses = [client.post("/webhook", json=e, headers={"X-Diun-Secret": "s3cret"})
+                     for e in events]
+
+        async def run_all():
+            await asyncio.gather(*spawned)
+
+        asyncio.run(run_all())
+    return responses
+
+
+def _event(image, container):
+    return {**DIUN_PAYLOAD, "image": image, "metadata": {"ctn_names": container}}
+
+
+TWO_IMAGE_SERVICE = {
+    "uuid": "svc-2",
+    "status": "running:healthy",
+    "server": {"name": "server1"},
+    "applications": [
+        {"name": "nginx", "image": "registry.example.com/team/app-nginx:latest"},
+        {"name": "php", "image": "registry.example.com/team/app-php:latest"},
+    ],
+    "databases": [{"name": "db", "image": "postgres:18-alpine"}],
+}
+
+NGINX_EVENT = _event("registry.example.com/team/app-nginx:latest", "nginx-svc-2")
+PHP_EVENT = _event("registry.example.com/team/app-php:latest", "php-svc-2")
+
+
+def test_service_restart_lock_is_per_service():
+    import main
+    _reset_redeploy_state()
+    assert main.service_restart_lock("svc-1") is main.service_restart_lock("svc-1")
+    assert main.service_restart_lock("svc-1") is not main.service_restart_lock("svc-2")
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, 10.0), ("0", 0.0), ("2.5", 2.5), ("-1", 10.0), ("soon", 10.0),
+])
+def test_deploy_debounce_seconds(value, expected):
+    import main
+    env = {} if value is None else {"DEPLOY_DEBOUNCE_SECONDS": value}
+    with patch.dict(os.environ, env, clear=True):
+        assert main.deploy_debounce_seconds() == expected
+
+
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
+@patch("main.watch_deployment", new_callable=AsyncMock)
+@patch("main.send_notification")
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_two_images_of_one_service_restart_it_once(mock_coolify, mock_trigger, mock_notify,
+                                                   mock_watch, mock_status):
+    mock_coolify.return_value = [TWO_IMAGE_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+
+    first, second = _post_webhooks([NGINX_EVENT, PHP_EVENT])
+
+    assert first.json()["action"] == "auto-deploy-scheduled"
+    assert second.json()["action"] == "auto-deploy-merged"
+    mock_trigger.assert_awaited_once()
+    assert mock_trigger.call_args.args[2] == "svc-2"
+    mock_watch.assert_awaited_once()
+    kwargs = mock_watch.call_args.kwargs
+    assert "nginx-svc-2" in kwargs["container_name"] and "php-svc-2" in kwargs["container_name"]
+    assert "app-nginx" in kwargs["image"] and "app-php" in kwargs["image"]
+
+
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
+@patch("main.watch_deployment", new_callable=AsyncMock)
+@patch("main.send_notification")
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_two_services_restart_each(mock_coolify, mock_trigger, mock_notify, mock_watch, mock_status):
+    mock_coolify.return_value = [MATCHING_SERVICE, TWO_IMAGE_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+
+    responses = _post_webhooks([DIUN_PAYLOAD, NGINX_EVENT])
+
+    assert [r.json()["action"] for r in responses] == ["auto-deploy-scheduled"] * 2
+    assert sorted(c.args[2] for c in mock_trigger.call_args_list) == ["svc-1", "svc-2"]
+
+
+def test_update_during_a_restart_restarts_again_afterwards_never_at_once():
+    """An image published after the first restart pulled must still be deployed,
+    by a second restart that starts only once the first one is over."""
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    timeline = []
+
+    async def trigger(url, token, uuid):
+        timeline.append(("trigger", uuid))
+        return {"ok": True, "deployment_uuid": None}
+
+    async def watch(url, token, uuid, baseline, **kwargs):
+        timeline.append(("watch-start", kwargs["container_name"]))
+        if len(timeline) == 2:
+            # A webhook arrives while the first restart is being watched
+            main.schedule_service_redeploy("http://coolify", "token", "svc-2", "running:healthy",
+                                           "php-svc-2", "app-php:latest", "server1", "")
+        await asyncio.sleep(0.05)
+        timeline.append(("watch-end", kwargs["container_name"]))
+
+    async def scenario():
+        spawned = []
+        with patch("main.spawn", new=lambda coro: spawned.append(asyncio.ensure_future(coro))):
+            main.schedule_service_redeploy("http://coolify", "token", "svc-2", "running:healthy",
+                                           "nginx-svc-2", "app-nginx:latest", "server1", "")
+            while any(not t.done() for t in spawned):
+                await asyncio.gather(*spawned)
+
+    with patch.dict(os.environ, {"DEPLOY_DEBOUNCE_SECONDS": "0"}, clear=True), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")):
+        asyncio.run(scenario())
+
+    assert timeline == [
+        ("trigger", "svc-2"), ("watch-start", "nginx-svc-2"), ("watch-end", "nginx-svc-2"),
+        ("trigger", "svc-2"), ("watch-start", "php-svc-2"), ("watch-end", "php-svc-2"),
+    ]
+
+
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
+@patch("main.watch_deployment", new_callable=AsyncMock)
+@patch("main.send_notification")
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_redeploy_rereads_the_baseline_once_it_holds_the_lock(mock_coolify, mock_trigger,
+                                                             mock_notify, mock_watch, mock_status):
+    """The listing seen by the webhook may be from the middle of another restart."""
+    mock_coolify.return_value = [{**TWO_IMAGE_SERVICE, "status": "exited"}]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+
+    _post_webhooks([NGINX_EVENT])
+
+    assert mock_watch.call_args.args[3] == "running:healthy"
+
+
+@patch("main.get_service_status", new_callable=AsyncMock, return_value=None)
+@patch("main.watch_deployment", new_callable=AsyncMock)
+@patch("main.send_notification")
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_redeploy_keeps_the_listing_baseline_when_coolify_is_unreachable(
+        mock_coolify, mock_trigger, mock_notify, mock_watch, mock_status):
+    mock_coolify.return_value = [TWO_IMAGE_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+
+    _post_webhooks([NGINX_EVENT])
+
+    assert mock_watch.call_args.args[3] == "running:healthy"
+
+
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
+@patch("main.watch_deployment", new_callable=AsyncMock)
+@patch("main.send_notification")
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_merged_redeploy_that_cannot_be_triggered_is_notified_once(mock_coolify, mock_trigger,
+                                                                  mock_notify, mock_watch, mock_status):
+    mock_coolify.return_value = [TWO_IMAGE_SERVICE]
+    mock_trigger.return_value = {"ok": False, "deployment_uuid": None}
+
+    _post_webhooks([NGINX_EVENT, PHP_EVENT])
+
+    mock_watch.assert_not_awaited()
+    mock_notify.assert_called_once()
+    title, body = mock_notify.call_args.args[1], mock_notify.call_args.args[2]
+    assert "❌" in title and "nginx-svc-2" in title and "php-svc-2" in title
+    assert "/deploy?uuid=" in body
+
+
+def test_series_upgrade_waits_for_a_running_restart():
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    main._series_last_attempt.clear()
+    order = []
+
+    async def apply(service, service_name, target_tag):
+        order.append("upgrade")
+        return "applied"
+
+    async def scenario():
+        lock = main.service_restart_lock("lychee-svc-uuid")
+        await lock.acquire()
+        upgrade = asyncio.ensure_future(main.upgrade_resource(LYCHEE_SERVICE, "lychee", "v6.10.4"))
+        await asyncio.sleep(0.01)
+        order.append("restart-over")
+        lock.release()
+        return await upgrade
+
+    with patch.dict(os.environ, SERIES_ENV, clear=True), \
+         patch("main._apply_series_upgrade", new=apply):
+        assert asyncio.run(scenario()) == "applied"
+    assert order == ["restart-over", "upgrade"]
+
+
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_manual_deploy_refuses_while_the_service_restarts(mock_coolify, mock_trigger):
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    full_uuid = "svc000000000000000000001"
+    mock_coolify.return_value = [{**MATCHING_SERVICE, "uuid": full_uuid}]
+    lock = main.service_restart_lock(full_uuid)
+    asyncio.run(lock.acquire())
+    try:
+        with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+            resp = client.get("/deploy", params={"uuid": full_uuid, "secret": "s3cret"})
+    finally:
+        lock.release()
+
+    mock_trigger.assert_not_awaited()
+    assert "already running" in resp.text
+
+
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_manual_deploy_holds_the_lock_until_the_service_is_back(mock_coolify, mock_trigger):
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    full_uuid = "svc000000000000000000001"
+    mock_coolify.return_value = [{**MATCHING_SERVICE, "uuid": full_uuid}]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+    spawned = []
+    seen = {}
+
+    async def wait(url, token, uuid, baseline, container_name, **kwargs):
+        seen["locked"] = main.service_restart_lock(uuid).locked()
+        seen["baseline"] = baseline
+        return True, baseline, ""
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True), \
+         patch("main.spawn", new=lambda coro: spawned.append(coro)), \
+         patch("main.wait_for_service", new=wait):
+        resp = client.get("/deploy", params={"uuid": full_uuid, "secret": "s3cret"})
+        assert main.service_restart_lock(full_uuid).locked()
+
+        async def run_all():
+            await asyncio.gather(*spawned)
+
+        asyncio.run(run_all())
+
+    assert "Success" in resp.text
+    assert seen == {"locked": True, "baseline": "running:healthy"}
+    assert not main.service_restart_lock(full_uuid).locked()
+
+
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_manual_deploy_releases_the_lock_when_coolify_refuses(mock_coolify, mock_trigger):
+    import main
+    _reset_redeploy_state()
+    full_uuid = "svc000000000000000000001"
+    mock_coolify.return_value = [{**MATCHING_SERVICE, "uuid": full_uuid}]
+    mock_trigger.return_value = {"ok": False, "deployment_uuid": None}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.get("/deploy", params={"uuid": full_uuid, "secret": "s3cret"})
+
+    assert "Failed" in resp.text
+    assert not main.service_restart_lock(full_uuid).locked()
+
+
+def test_hold_after_restart_waits_out_the_minimum_since_the_request():
+    """The watch can call a service back while Coolify is still pulling its images."""
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    slept = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    main._last_restart_request["svc-2"] = time.time() - 60
+    with patch("main.asyncio.sleep", new=fake_sleep):
+        asyncio.run(main.hold_after_restart("svc-2"))
+        asyncio.run(main.hold_after_restart("never-restarted"))
+
+    assert len(slept) == 1
+    assert main.RESTART_MIN_HOLD_SECONDS - 61 < slept[0] <= main.RESTART_MIN_HOLD_SECONDS - 60
+
+
+def test_trigger_records_the_request_even_when_it_fails():
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    failing = MagicMock()
+    failing.__aenter__ = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
+    failing.__aexit__ = AsyncMock(return_value=False)
+
+    with patch("main.httpx.AsyncClient", return_value=failing):
+        result = asyncio.run(main.trigger_coolify("http://coolify", "tok", "svc-2"))
+
+    assert result["ok"] is False
+    assert time.time() - main._last_restart_request["svc-2"] < 5
+
+
+def test_restart_lock_is_held_after_a_quick_watch():
+    """A second restart must not start right after a watch that saw nothing."""
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    order = []
+
+    async def trigger(url, token, uuid):
+        main._last_restart_request[uuid] = time.time()
+        order.append("trigger")
+        return {"ok": True, "deployment_uuid": None}
+
+    async def watch(*args, **kwargs):
+        order.append("watched")
+
+    async def hold(uuid):
+        order.append("hold")
+
+    async def scenario():
+        spawned = []
+        with patch("main.spawn", new=lambda coro: spawned.append(asyncio.ensure_future(coro))):
+            main.schedule_service_redeploy("http://coolify", "token", "svc-2", "running:healthy",
+                                           "nginx-svc-2", "app-nginx:latest", "server1", "")
+            await asyncio.gather(*spawned)
+
+    with patch.dict(os.environ, {"DEPLOY_DEBOUNCE_SECONDS": "0"}, clear=True), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.hold_after_restart", new=hold), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")):
+        asyncio.run(scenario())
+
+    assert order == ["trigger", "watched", "hold"]
+
+
+def test_series_upgrade_holds_the_lock_after_its_rollback():
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    main._series_last_attempt.clear()
+    order = []
+
+    async def apply(service, service_name, target_tag):
+        order.append("rollback-triggered")
+        return "failed"
+
+    async def hold(uuid):
+        assert main.service_restart_lock(uuid).locked()
+        order.append("hold")
+
+    with patch.dict(os.environ, SERIES_ENV, clear=True), \
+         patch("main._apply_series_upgrade", new=apply), \
+         patch("main.hold_after_restart", new=hold):
+        assert asyncio.run(main.upgrade_resource(LYCHEE_SERVICE, "lychee", "v6.10.4")) == "failed"
+    assert order == ["rollback-triggered", "hold"]
+
+
+def test_updates_during_the_debounce_join_the_same_restart():
+    """With real timing: a webhook arriving while the first one waits is merged."""
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    triggers = []
+
+    async def trigger(url, token, uuid):
+        triggers.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    async def scenario():
+        spawned = []
+        with patch("main.spawn", new=lambda coro: spawned.append(asyncio.ensure_future(coro))):
+            first = main.schedule_service_redeploy("http://coolify", "token", "svc-2", "running:healthy",
+                                                   "nginx-svc-2", "app-nginx:latest", "server1", "")
+            await asyncio.sleep(0.02)
+            second = main.schedule_service_redeploy("http://coolify", "token", "svc-2", "running:healthy",
+                                                    "php-svc-2", "app-php:latest", "server1", "")
+            await asyncio.gather(*spawned)
+        return first, second
+
+    with patch.dict(os.environ, {"DEPLOY_DEBOUNCE_SECONDS": "0.1"}, clear=True), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")):
+        assert asyncio.run(scenario()) == ("auto-deploy-scheduled", "auto-deploy-merged")
+    assert triggers == ["svc-2"]
+
+
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_manual_deploy_refuses_while_an_automatic_redeploy_waits(mock_coolify, mock_trigger):
+    """Never queue behind it: the request would hang for the whole restart."""
+    import main
+    _reset_redeploy_state()
+    full_uuid = "svc000000000000000000001"
+    mock_coolify.return_value = [{**MATCHING_SERVICE, "uuid": full_uuid}]
+    main._pending_redeploys[full_uuid] = {"containers": ["nextcloud"], "images": []}
+
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True):
+        resp = client.get("/deploy", params={"uuid": full_uuid, "secret": "s3cret"})
+
+    mock_trigger.assert_not_awaited()
+    assert "already running" in resp.text

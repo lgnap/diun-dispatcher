@@ -81,6 +81,15 @@ WATCH_TRANSITION_GRACE_SECONDS = 60
 # How long the status must hold before the redeploy counts as a success: Coolify
 # can report running:healthy while the new container is still starting.
 WATCH_STABLE_SECONDS = 30
+# Diun reports every image of a pass within a second or so: wait this long after
+# the first update of a service so that its other images join the same restart.
+DEPLOY_DEBOUNCE_DEFAULT_SECONDS = 10.0
+# How long a service stays locked after a restart was requested, whatever the
+# watch concluded: with latest=true Coolify first pulls the images while the old
+# containers still report healthy, so "back to its baseline" can be seen before
+# the containers are even recreated. Also covers a request that timed out on our
+# side but that Coolify may still have accepted.
+RESTART_MIN_HOLD_SECONDS = 5 * 60
 
 
 # ---------------------------------------------------------------------------
@@ -459,6 +468,8 @@ async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> di
     an ordinary restart still deploys the same content as before.
     """
     url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}/restart?latest=true"
+    # Before the request: one that times out may still have reached Coolify
+    _last_restart_request[uuid] = time.time()
     cf_headers = get_cloudflare_headers()
     headers = {
         "Authorization": f"Bearer {coolify_token}",
@@ -753,6 +764,131 @@ def _notify_deployment_done(container_name: str, image: str, server: str,
         build_notification_body(server, image, container_name,
                                 f"\n📊 Status: {status}{extra}"),
     )
+
+
+# ---------------------------------------------------------------------------
+# One restart at a time per Coolify service
+#
+# Coolify does not queue service restarts: two restarts of one service run two
+# "docker compose up" at once. On 2026-10-05 that left two database containers
+# on the same data directory for two days. Every restart of a service therefore
+# holds its lock from the trigger until the service is back, and the updates of
+# one Diun pass are merged into a single restart.
+# ---------------------------------------------------------------------------
+_service_restart_locks: dict[str, asyncio.Lock] = {}
+# When a restart of each service was last requested from Coolify
+_last_restart_request: dict[str, float] = {}
+# A restart scheduled but not triggered yet, per service: later updates join it
+_pending_redeploys: dict[str, dict] = {}
+
+
+def service_restart_lock(uuid: str) -> asyncio.Lock:
+    return _service_restart_locks.setdefault(uuid, asyncio.Lock())
+
+
+async def hold_after_restart(uuid: str) -> None:
+    """Keep the service's lock until RESTART_MIN_HOLD_SECONDS after its last
+    restart request. Called by every holder of the lock before releasing it."""
+    remaining = _last_restart_request.get(uuid, 0) + RESTART_MIN_HOLD_SECONDS - time.time()
+    if remaining > 0:
+        logger.info(f"Service {uuid} stays locked {int(remaining)} s more after its restart")
+        await asyncio.sleep(remaining)
+
+
+def deploy_debounce_seconds() -> float:
+    raw = os.getenv("DEPLOY_DEBOUNCE_SECONDS", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEPLOY_DEBOUNCE_DEFAULT_SECONDS
+    return value if value >= 0 else DEPLOY_DEBOUNCE_DEFAULT_SECONDS
+
+
+def schedule_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
+                              baseline_status: str, container_name: str, image: str,
+                              server: str, deploy_link: str) -> str:
+    """Restart a service for an updated image, merged with the other updates
+    of the same service that arrive before the restart is triggered.
+
+    Returns "auto-deploy-scheduled", or "auto-deploy-merged" when the update
+    joined a restart already waiting. An update arriving once the restart was
+    triggered schedules another one: its image may have been published after
+    the first restart pulled.
+    """
+    pending = _pending_redeploys.get(uuid)
+    if pending is not None:
+        if container_name not in pending["containers"]:
+            pending["containers"].append(container_name)
+        if image not in pending["images"]:
+            pending["images"].append(image)
+        logger.info(f"Update of {image} merged into the pending restart of service {uuid}")
+        return "auto-deploy-merged"
+
+    pending = {
+        "containers": [container_name],
+        "images": [image],
+        "baseline": baseline_status,
+        "server": server,
+        "deploy_link": deploy_link,
+    }
+    _pending_redeploys[uuid] = pending
+    spawn(_run_service_redeploy(coolify_url, coolify_token, uuid, pending))
+    return "auto-deploy-scheduled"
+
+
+async def _run_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
+                                pending: dict) -> None:
+    try:
+        await asyncio.sleep(deploy_debounce_seconds())
+        async with service_restart_lock(uuid):
+            if _pending_redeploys.get(uuid) is pending:
+                del _pending_redeploys[uuid]
+            try:
+                await _redeploy(coolify_url, coolify_token, uuid, pending)
+            finally:
+                await hold_after_restart(uuid)
+    finally:
+        if _pending_redeploys.get(uuid) is pending:
+            del _pending_redeploys[uuid]
+
+
+async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: dict) -> None:
+    containers = ", ".join(pending["containers"])
+    images = ", ".join(pending["images"])
+    # The listing the webhook saw may date from the middle of another restart
+    baseline = await get_service_status(coolify_url, coolify_token, uuid) or pending["baseline"]
+    result = await trigger_coolify(coolify_url, coolify_token, uuid)
+    if not result["ok"]:
+        send_notification(
+            load_apprise_urls(),
+            f"❌ {containers} — auto-deploy could not be triggered",
+            build_notification_body(pending["server"], images, containers,
+                                    pending["deploy_link"]),
+        )
+        return
+    logger.info(f"Auto-deploy triggered for {containers} (service {uuid}), "
+                f"baseline status={baseline}")
+    await watch_deployment(coolify_url, coolify_token, uuid, baseline,
+                           container_name=containers, image=images,
+                           server=pending["server"])
+
+
+async def _release_when_back(coolify_url: str, coolify_token: str, uuid: str,
+                             baseline_status: str, container_name: str,
+                             lock: asyncio.Lock) -> None:
+    """Hold a manual redeploy's lock until the service is back (or given up on)."""
+    try:
+        await wait_for_service(coolify_url, coolify_token, uuid, baseline_status, container_name)
+        await hold_after_restart(uuid)
+    finally:
+        lock.release()
+
+
+async def _release_after_hold(uuid: str, lock: asyncio.Lock) -> None:
+    try:
+        await hold_after_restart(uuid)
+    finally:
+        lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -1361,9 +1497,14 @@ async def upgrade_resource(service: dict, service_name: str, target_tag: str) ->
     blocked = series_upgrade_blocked(key)
     if blocked:
         return blocked
-    async with _series_lock(key):
+    uuid = service.get("uuid", "")
+    async with _series_lock(key), service_restart_lock(uuid):
         _series_last_attempt[key] = time.time()
-        return await _apply_series_upgrade(service, service_name, target_tag)
+        try:
+            return await _apply_series_upgrade(service, service_name, target_tag)
+        finally:
+            # Also covers the rollback restart, which is not watched
+            await hold_after_restart(uuid)
 
 
 async def _apply_series_upgrade(service: dict, service_name: str, target_tag: str) -> str:
@@ -1662,28 +1803,13 @@ async def diun_webhook(request: Request):
                     f"(configured: {configured}), nothing to do")
         return JSONResponse({"ok": True, "uuid": uuid, "action": "update-other-tag"})
 
-    # AUTO_DEPLOY ("update" of the tag in service): redeploy right away and stay
-    # silent until Coolify reports back.
+    # AUTO_DEPLOY ("update" of the tag in service): redeploy by itself, one restart
+    # per service for the whole Diun pass, and stay silent until Coolify reports back.
     if uuid and is_auto_deploy_enabled():
-        result = await trigger_coolify(coolify_url, coolify_token, uuid)
-        if result["ok"]:
-            baseline_status = matched_service.get("status", "")
-            logger.info(
-                f"Auto-deploy triggered for {container_name} (service {uuid}), "
-                f"baseline status={baseline_status}"
-            )
-            asyncio.create_task(watch_deployment(
-                coolify_url, coolify_token, uuid, baseline_status,
-                container_name=container_name, image=image, server=server_display,
-            ))
-            return JSONResponse({"ok": True, "uuid": uuid, "action": "auto-deploy"})
-
-        send_notification(
-            apprise_urls,
-            f"❌ {container_name} — auto-deploy could not be triggered",
-            build_notification_body(server_display, image, container_name, deploy_link),
-        )
-        return JSONResponse({"ok": True, "uuid": uuid, "action": "auto-deploy-failed"})
+        action = schedule_service_redeploy(
+            coolify_url, coolify_token, uuid, matched_service.get("status", ""),
+            container_name, image, server_display, deploy_link)
+        return JSONResponse({"ok": True, "uuid": uuid, "action": action})
 
     title = f"{status_emoji} {container_name} — {available_text}"
     body = build_notification_body(server_display, image, container_name, deploy_link)
@@ -1725,18 +1851,38 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
     image = "unknown"
     hostname = "unknown"
     deployed = False
+    busy = False
 
     services = await get_coolify_applications(coolify_url, coolify_token)
     deployment = find_deployment_by_uuid(services, resolved_uuid)
-    if deployment:
+    lock = service_restart_lock(resolved_uuid)
+    # A pending automatic redeploy counts too: the request would otherwise
+    # queue behind it and hang for the whole restart.
+    if deployment and (lock.locked() or resolved_uuid in _pending_redeploys):
+        busy = True
+        logger.warning(f"✗ Not deploying {resolved_uuid}: a redeploy of this service is already running")
+    elif deployment:
         container_name = deployment['container_name']
         image = deployment['image']
         hostname = deployment['hostname']
         deployment_info = f"{container_name} ({deployment['type']}) @ {hostname}"
         logger.info(f"🚀 Deploying: {deployment_info} | Image: {image}")
 
-        # Trigger deployment
-        deployed = (await trigger_coolify(coolify_url, coolify_token, resolved_uuid))["ok"]
+        # Trigger deployment, and keep the service locked until it is back
+        await lock.acquire()
+        try:
+            deployed = (await trigger_coolify(coolify_url, coolify_token, resolved_uuid))["ok"]
+        except BaseException:
+            lock.release()
+            raise
+        if deployed:
+            baseline = next((s.get("status", "") for s in services
+                             if s.get("uuid") == resolved_uuid), "")
+            spawn(_release_when_back(coolify_url, coolify_token, resolved_uuid,
+                                     baseline, container_name, lock))
+        else:
+            # Refused or timed out: Coolify may still have accepted it
+            spawn(_release_after_hold(resolved_uuid, lock))
 
         if deployed:
             logger.info(f"✓ Deployment triggered successfully: {deployment_info}")
@@ -1746,6 +1892,7 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
 
     return templates.TemplateResponse(request, "deploy_confirmation.html", {
         "deployed": deployed,
+        "busy": busy,
         "container_name": container_name,
         "image": image,
         "hostname": hostname,

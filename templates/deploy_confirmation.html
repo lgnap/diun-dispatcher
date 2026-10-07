@@ -175,7 +175,7 @@
 
         <div class="status-card">
             <div class="status-badge {% if deployed %}status-success{% else %}status-error{% endif %}">
-                {% if deployed %}✓ Success{% else %}✗ Failed{% endif %}
+                {% if deployed %}✓ Success{% elif busy %}✗ Not triggered: a redeploy of this service is already running{% else %}✗ Failed{% endif %}
             </div>
 
             <div class="deployment-details">

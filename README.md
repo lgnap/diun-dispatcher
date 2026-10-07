@@ -64,6 +64,7 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | Variable              | Default | Description |
 |-----------------------|---------|-------------|
 | `AUTO_DEPLOY`         | `false` | Redeploy matched images automatically instead of only sending a deploy link (`true`/`1`/`yes`/`on`). See [Automatic deployments](#automatic-deployments) |
+| `DEPLOY_DEBOUNCE_SECONDS` | `10` | How long an automatic redeploy waits for the other images of the same service to be reported, so that they share one restart. See [One restart at a time per service](#one-restart-at-a-time-per-service) |
 | `WEBHOOK_SECRET`      | (none)  | Shared secret for webhook validation (validates `X-Diun-Secret` header) |
 | `DISPATCHER_URL`      | (none)  | Your dispatcher URL for manual deploy links in notifications (e.g., `https://dispatcher.example.com`) |
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
@@ -144,7 +145,8 @@ The dispatcher handles these automatically — no manual mapping needed.
 ## Automatic deployments
 
 With `AUTO_DEPLOY=true`, a Diun **`update`** event that matches a Coolify service
-triggers the redeploy immediately — no click needed. `IGNORE_CONTAINERS` still wins: an
+triggers the redeploy by itself — no click needed — after a short wait
+(`DEPLOY_DEBOUNCE_SECONDS`, see below). `IGNORE_CONTAINERS` still wins: an
 ignored container is never deployed automatically.
 
 ### `update` deploys, `new` only informs
@@ -218,6 +220,34 @@ What you get:
 | The service never came back within 15 minutes | `⏱️ <container> — deployment status unknown`, with the last status seen and a manual deploy link |
 
 A successful auto-deploy sends **one** notification, once it is over.
+
+### One restart at a time per service
+
+Coolify does not queue service restarts: two restart requests for one service run two
+`docker compose up` at the same time, and they can trip over each other while
+recreating the containers — down to two database containers left running on the same
+data directory. Diun reports every image of a pass within a second or so, so a service
+with several watched images (an `nginx` and a `php` built together, say) would be
+restarted once per image, all at once.
+
+So every restart the dispatcher requests holds a per-service lock, from the request
+until the service is back (or given up on), and **at least 5 minutes** after the
+request in any case: with `latest=true` Coolify first pulls the images while the old
+containers still report healthy, so the service can look "back" before it was even
+recreated — and a request that timed out on our side may still have been accepted:
+
+- **automatic redeploys** wait `DEPLOY_DEBOUNCE_SECONDS` after the first update of a
+  service; the other updates of that service arriving meanwhile, or while it waits for
+  the lock, **join the same restart** (the webhook answers `auto-deploy-merged`, and the
+  notification lists every container and image). An update arriving once the restart
+  was requested schedules another one, run after the first is over: its image may have
+  been published after the first restart pulled;
+- **virtual series upgrades** (and their rollback) run under the same lock;
+- **`/deploy`** does nothing while the service is being restarted, and says so on the
+  page; otherwise it holds the lock until the service is back.
+
+Only restarts requested through the dispatcher are coordinated: one started from
+Coolify's UI at the same moment is not.
 
 ## Virtual series: follow patches without a series tag
 
@@ -355,6 +385,10 @@ Receives Diun webhook events.
   "uuid": "a1b2c3d4"
 }
 ```
+
+With `AUTO_DEPLOY`, `action` says what became of the event: `auto-deploy-scheduled` (a
+restart will follow) or `auto-deploy-merged` (it joined a restart already waiting for
+that service). Whether Coolify accepted the restart is reported by notification.
 
 ### GET `/deploy`
 
