@@ -55,6 +55,6 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
 
 ## Reprise de session
 1. Lire `HANDOFF.md` en premier (état, en cours, prochaines étapes) ; contexte
-   infra détaillé : `TODO.md` du dépôt d'infra privé MigratePark et la mémoire du projet.
+   infra détaillé : `TODO.md` du dépôt d'infra privé et la mémoire du projet.
 2. Vérifier `git status`, la branche courante et `git log origin/main -5`.
 3. Avant de terminer une session : mettre `HANDOFF.md` à jour (date, fait, en cours, suite).
