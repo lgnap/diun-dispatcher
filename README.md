@@ -68,6 +68,7 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | `WEBHOOK_SECRET`      | (none)  | Shared secret for webhook validation (validates `X-Diun-Secret` header) |
 | `DISPATCHER_URL`      | (none)  | Your dispatcher URL for manual deploy links in notifications (e.g., `https://dispatcher.example.com`) |
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
+| `NOTIFY_LEVEL`        | `all`   | `all` sends every notification; `failures` keeps only what went wrong (failed or stalled redeploy, failed rebuild or series upgrade) and drops successes and announcements. See [Notification format](#notification-format) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
 | `SERIES_CHECK_HOUR`   | `5`     | Hour of the day (0-23, container time zone) of the daily virtual series check |
 | `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file |
@@ -453,6 +454,19 @@ Example:
 
 🚀 Deploy [a1b2c3d4]: https://dispatcher.example.com/deploy?uuid=...
 ```
+
+### Only be notified of failures
+
+`NOTIFY_LEVEL=failures` keeps the notifications that report a problem and drops the rest:
+
+| Kept (failures) | Dropped |
+|-----------------|---------|
+| auto-deploy could not be triggered; service never came back; rebuild interrupted or stopped on a failure; series upgrade failed or compose unreadable | ✅ redeploy done, ✅ rebuild done, ✅ series upgrade applied; new image / new version / deploy link; series proposals; base image announcements |
+
+Dropped notifications still appear in the logs (`NOTIFY_LEVEL=failures, not sending: …`).
+The default is `all`; an unknown value falls back to `all` with a warning. Since a quiet
+dispatcher then means either "all went well" or "the dispatcher is down", consider an
+external check on [`/health`](#get-health).
 
 ## Cloudflare Access
 

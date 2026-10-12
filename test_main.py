@@ -2456,3 +2456,75 @@ def test_manual_deploy_refuses_while_an_automatic_redeploy_waits(mock_coolify, m
 
     mock_trigger.assert_not_awaited()
     assert "already running" in resp.text
+
+
+# ============================================================================
+# NOTIFY_LEVEL: all (default) or failures only
+# ============================================================================
+
+def _send(level, **kwargs):
+    import main
+    env = {} if level is None else {"NOTIFY_LEVEL": level}
+    with patch.dict(os.environ, env, clear=True), \
+         patch('main.apprise.Apprise') as apobj:
+        main.send_notification(["json://x"], "title", "body", **kwargs)
+    return apobj.return_value.notify
+
+
+def test_notify_level_defaults_to_all():
+    assert _send(None, info=True).called
+    assert _send(None).called
+
+
+def test_notify_level_all_sends_info_and_failures():
+    assert _send("all", info=True).called
+    assert _send("all").called
+
+
+def test_notify_level_failures_drops_info_but_keeps_failures():
+    assert not _send("failures", info=True).called
+    assert _send("failures").called
+
+
+def test_notify_level_is_case_and_space_tolerant():
+    assert not _send(" Failures ", info=True).called
+
+
+def test_notify_level_unknown_value_falls_back_to_all(caplog):
+    assert _send("errors", info=True).called
+    assert "NOTIFY_LEVEL" in caplog.text
+
+
+@patch('main.send_notification')
+def test_watch_success_is_info_and_unknown_status_is_a_failure(mock_notify):
+    _watch(["restarting:unhealthy", "running:healthy"])
+    assert mock_notify.call_args.kwargs.get("info") is True
+
+    mock_notify.reset_mock()
+    _watch(["exited"], timeout=60)
+    assert "⏱️" in mock_notify.call_args.args[1]
+    assert not mock_notify.call_args.kwargs.get("info")
+
+
+def test_rebuild_summary_is_info_on_success_and_failure_otherwise():
+    _, m = _rebuild(["finished", "finished", "finished"])
+    assert m["send_notification"].call_args.kwargs.get("info") is True
+
+    _, m = _rebuild(["finished", "failed"])
+    assert not m["send_notification"].call_args.kwargs.get("info")
+
+
+@patch("main.get_service_status", new_callable=AsyncMock, return_value="running:healthy")
+@patch('main.send_notification')
+@patch('main.trigger_coolify', new_callable=AsyncMock, return_value={"ok": False, "deployment_uuid": None})
+@patch('main.get_coolify_applications', new_callable=AsyncMock, return_value=[MATCHING_SERVICE])
+def test_webhook_announcements_are_info_and_failed_trigger_is_not(mock_coolify, mock_trigger, mock_notify, mock_status):
+    with patch.dict(os.environ, {**AUTO_DEPLOY_ENV, "AUTO_DEPLOY": "false"}, clear=True):
+        client.post("/webhook?secret=s3cret", json=DIUN_PAYLOAD)
+    assert mock_notify.call_args.kwargs.get("info") is True
+
+    mock_notify.reset_mock()
+    _post_webhooks([DIUN_PAYLOAD])
+    mock_notify.assert_called_once()
+    assert "could not be triggered" in mock_notify.call_args.args[1]
+    assert not mock_notify.call_args.kwargs.get("info")
