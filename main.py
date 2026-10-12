@@ -1695,6 +1695,29 @@ async def series_check_loop() -> None:
 # Routes
 # ---------------------------------------------------------------------------
 
+# A rejected webhook is worth one notification, not one per attempt: the endpoint may be
+# reachable by scanners. Throttled per reason.
+REJECTED_WEBHOOK_NOTIFY_INTERVAL_SECONDS = 600
+_rejected_webhook_last_notified: dict[str, float] = {}
+
+
+def notify_rejected_webhook(request: Request, reason: str) -> None:
+    """Tell about a webhook the dispatcher refused. Method and path only: the query
+    string carries the secret."""
+    now = time.time()
+    last = _rejected_webhook_last_notified.get(reason)
+    if last is not None and now - last < REJECTED_WEBHOOK_NOTIFY_INTERVAL_SECONDS:
+        return
+    _rejected_webhook_last_notified[reason] = now
+    send_notification(
+        load_apprise_urls(),
+        f"❌ Webhook rejected — {reason}",
+        f"⚠️ {request.method} {request.url.path} was refused with: {reason}.\n"
+        f"Further identical rejections are not notified for "
+        f"{REJECTED_WEBHOOK_NOTIFY_INTERVAL_SECONDS // 60} min.",
+    )
+
+
 # Diun sends webhooks with GET by default (JSON in the body); accept both.
 @app.api_route("/webhook", methods=["GET", "POST"])
 async def diun_webhook(request: Request):
@@ -1713,9 +1736,11 @@ async def diun_webhook(request: Request):
         logger.info(f"✓ Parsed JSON successfully")
     except json.JSONDecodeError as e:
         logger.error(f"✗ Failed to parse JSON from body: {e}")
+        notify_rejected_webhook(request, "invalid JSON")
         raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
         logger.error(f"✗ Error reading body: {e}")
+        notify_rejected_webhook(request, "request body unreadable")
         raise HTTPException(status_code=400, detail="Error reading request")
 
     # Optional secret validation
@@ -1727,6 +1752,7 @@ async def diun_webhook(request: Request):
         )
         if provided != secret:
             logger.warning("Invalid webhook secret")
+            notify_rejected_webhook(request, "invalid secret")
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     logger.info(f"Received webhook payload: {json.dumps(data, indent=2)}")
@@ -1836,7 +1862,10 @@ async def diun_webhook(request: Request):
     title = f"{status_emoji} {container_name} — {available_text}"
     body = build_notification_body(server_display, image, container_name, deploy_link)
 
-    send_notification(apprise_urls, title, body, info=True)
+    # Coolify is configured but runs nothing for this image: Diun watches something the
+    # dispatcher cannot act on, which is a problem to look at, not an announcement.
+    unknown_to_coolify = bool(coolify_url and coolify_token) and not uuid
+    send_notification(apprise_urls, title, body, info=not unknown_to_coolify)
 
     return JSONResponse({"ok": True, "uuid": uuid})
 

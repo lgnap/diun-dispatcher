@@ -2528,3 +2528,75 @@ def test_webhook_announcements_are_info_and_failed_trigger_is_not(mock_coolify, 
     mock_notify.assert_called_once()
     assert "could not be triggered" in mock_notify.call_args.args[1]
     assert not mock_notify.call_args.kwargs.get("info")
+
+
+# ============================================================================
+# Rejected webhooks and unknown resources are failures
+# ============================================================================
+
+def _rejected_env(**extra):
+    return {"WEBHOOK_SECRET": "s3cret", **extra}
+
+
+@patch('main.send_notification')
+def test_webhook_with_wrong_secret_notifies_a_failure_without_leaking_secrets(mock_notify):
+    import main
+    main._rejected_webhook_last_notified.clear()
+    with patch.dict(os.environ, _rejected_env(), clear=True):
+        resp = client.post("/webhook?secret=guess123", json=DIUN_PAYLOAD)
+    assert resp.status_code == 401
+    mock_notify.assert_called_once()
+    title, body = mock_notify.call_args.args[1], mock_notify.call_args.args[2]
+    assert "❌" in title and "secret" in title.lower()
+    assert "/webhook" in body
+    assert "guess123" not in title + body and "s3cret" not in title + body
+    assert not mock_notify.call_args.kwargs.get("info")
+
+
+@patch('main.send_notification')
+def test_webhook_with_invalid_json_notifies_a_failure(mock_notify):
+    import main
+    main._rejected_webhook_last_notified.clear()
+    with patch.dict(os.environ, _rejected_env(), clear=True):
+        resp = client.post("/webhook?secret=s3cret", content=b"not json")
+    assert resp.status_code == 400
+    mock_notify.assert_called_once()
+    assert "❌" in mock_notify.call_args.args[1]
+    assert "JSON" in mock_notify.call_args.args[1]
+    assert not mock_notify.call_args.kwargs.get("info")
+
+
+@patch('main.send_notification')
+def test_rejected_webhook_notifications_are_throttled_per_reason(mock_notify):
+    import main
+    main._rejected_webhook_last_notified.clear()
+    clock = {"now": 1000.0}
+    with patch.dict(os.environ, _rejected_env(), clear=True), \
+         patch('main.time.time', new=lambda: clock["now"]):
+        for _ in range(3):
+            client.post("/webhook?secret=bad", json=DIUN_PAYLOAD)
+        assert mock_notify.call_count == 1
+        client.post("/webhook?secret=s3cret", content=b"not json")  # another reason
+        assert mock_notify.call_count == 2
+        clock["now"] += main.REJECTED_WEBHOOK_NOTIFY_INTERVAL_SECONDS + 1
+        client.post("/webhook?secret=bad", json=DIUN_PAYLOAD)
+        assert mock_notify.call_count == 3
+
+
+@patch('main.send_notification')
+@patch('main.get_coolify_applications', new_callable=AsyncMock, return_value=[MATCHING_SERVICE])
+def test_webhook_for_an_image_unknown_to_coolify_is_a_failure(mock_coolify, mock_notify):
+    payload = {**DIUN_PAYLOAD, "image": "docker.io/library/unknown:1",
+               "metadata": {"ctn_names": "unknown"}}
+    with patch.dict(os.environ, {**AUTO_DEPLOY_ENV, "AUTO_DEPLOY": "false"}, clear=True):
+        client.post("/webhook?secret=s3cret", json=payload)
+    mock_notify.assert_called_once()
+    assert "no deploy available" in mock_notify.call_args.args[1]
+    assert not mock_notify.call_args.kwargs.get("info")
+
+
+@patch('main.send_notification')
+def test_webhook_without_coolify_configured_stays_an_announcement(mock_notify):
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        client.post("/webhook?secret=s3cret", json=DIUN_PAYLOAD)
+    assert mock_notify.call_args.kwargs.get("info") is True
