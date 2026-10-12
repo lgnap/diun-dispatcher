@@ -523,7 +523,21 @@ def build_notification_body(server: str, image: str, container_name: str, extra:
     )
 
 
-def send_notification(urls: list[str], title: str, body: str) -> None:
+def notify_failures_only() -> bool:
+    """NOTIFY_LEVEL=failures keeps only the notifications about something that went wrong."""
+    level = os.getenv("NOTIFY_LEVEL", "all").strip().lower()
+    if level not in ("all", "failures"):
+        logger.warning(f"Unknown NOTIFY_LEVEL {level!r} (expected all or failures), using all")
+        return False
+    return level == "failures"
+
+
+def send_notification(urls: list[str], title: str, body: str, info: bool = False) -> None:
+    """Send a notification. `info` marks what is not a failure (successes, announcements):
+    NOTIFY_LEVEL=failures drops those. A call that forgets it errs on the side of sending."""
+    if info and notify_failures_only():
+        logger.info(f"NOTIFY_LEVEL=failures, not sending: {title}")
+        return
     if not urls:
         logger.warning("No APPRISE_URLS configured, skipping notification")
         return
@@ -763,6 +777,8 @@ def _notify_deployment_done(container_name: str, image: str, server: str,
         f"✅ {container_name} — deployed",
         build_notification_body(server, image, container_name,
                                 f"\n📊 Status: {status}{extra}"),
+
+        info=True,
     )
 
 
@@ -1336,7 +1352,8 @@ async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
         title = f"✅ {len(results)} application(s) rebuilt on {image_tag(image)} ({version})"
     else:
         title = f"❌ Rebuild on {image_tag(image)} ({version}) stopped at {names.get(failed[0], failed[0])}"
-    send_notification(load_apprise_urls(), title, f"🖼️ Base: {image}\n\n" + "\n".join(lines))
+    send_notification(load_apprise_urls(), title, f"🖼️ Base: {image}\n\n" + "\n".join(lines),
+                      info=failed is None)
     return results
 
 
@@ -1374,6 +1391,7 @@ async def handle_base_image_event(image: str, status: str, digest: str | None,
             f"🖼️ Base: {image}\n\nℹ️ Nothing rebuilt: {len(uuids)} application(s) stay on "
             f"their last build. Plan the upgrade, then update rebuild_series in Diun's "
             f"bases.yml.\n{listed}",
+            info=True,
         )
         return JSONResponse({"ok": True, "action": "base-announced", "version": version})
 
@@ -1383,6 +1401,7 @@ async def handle_base_image_event(image: str, status: str, digest: str | None,
             f"⬆️ {image_tag(image)} — base updated ({version})",
             f"🖼️ Base: {image}\n\nℹ️ AUTO_DEPLOY is off: redeploy these applications in "
             f"Coolify, staging first.\n{listed}",
+            info=True,
         )
         return JSONResponse({"ok": True, "action": "base-notified", "version": version})
 
@@ -1564,7 +1583,8 @@ async def _apply_series_upgrade(service: dict, service_name: str, target_tag: st
     if back:
         send_notification(urls, f"✅ {service_name} {change} applied",
                           build_notification_body(server, new_image, service_name,
-                                                  f"\n📊 Status: {status}{note}"))
+                                                  f"\n📊 Status: {status}{note}"),
+                          info=True)
         return "applied"
 
     restored = await restore()
@@ -1602,6 +1622,7 @@ async def check_series(service: dict, service_name: str, policy: str, image: str
             ("\n\nℹ️ Follow policy announce: never applied automatically." if announce_only
              else f"\n\nℹ️ Follow policy {policy}: AUTO_DEPLOY is off, nothing was applied.")
             + build_upgrade_link(uuid, service_name, target)),
+        info=True,
     )
     return "proposed"
 
@@ -1674,6 +1695,29 @@ async def series_check_loop() -> None:
 # Routes
 # ---------------------------------------------------------------------------
 
+# A rejected webhook is worth one notification, not one per attempt: the endpoint may be
+# reachable by scanners. Throttled per reason.
+REJECTED_WEBHOOK_NOTIFY_INTERVAL_SECONDS = 600
+_rejected_webhook_last_notified: dict[str, float] = {}
+
+
+def notify_rejected_webhook(request: Request, reason: str) -> None:
+    """Tell about a webhook the dispatcher refused. Method and path only: the query
+    string carries the secret."""
+    now = time.time()
+    last = _rejected_webhook_last_notified.get(reason)
+    if last is not None and now - last < REJECTED_WEBHOOK_NOTIFY_INTERVAL_SECONDS:
+        return
+    _rejected_webhook_last_notified[reason] = now
+    send_notification(
+        load_apprise_urls(),
+        f"❌ Webhook rejected — {reason}",
+        f"⚠️ {request.method} {request.url.path} was refused with: {reason}.\n"
+        f"Further identical rejections are not notified for "
+        f"{REJECTED_WEBHOOK_NOTIFY_INTERVAL_SECONDS // 60} min.",
+    )
+
+
 # Diun sends webhooks with GET by default (JSON in the body); accept both.
 @app.api_route("/webhook", methods=["GET", "POST"])
 async def diun_webhook(request: Request):
@@ -1692,9 +1736,11 @@ async def diun_webhook(request: Request):
         logger.info(f"✓ Parsed JSON successfully")
     except json.JSONDecodeError as e:
         logger.error(f"✗ Failed to parse JSON from body: {e}")
+        notify_rejected_webhook(request, "invalid JSON")
         raise HTTPException(status_code=400, detail="Invalid JSON")
     except Exception as e:
         logger.error(f"✗ Error reading body: {e}")
+        notify_rejected_webhook(request, "request body unreadable")
         raise HTTPException(status_code=400, detail="Error reading request")
 
     # Optional secret validation
@@ -1706,6 +1752,7 @@ async def diun_webhook(request: Request):
         )
         if provided != secret:
             logger.warning("Invalid webhook secret")
+            notify_rejected_webhook(request, "invalid secret")
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     logger.info(f"Received webhook payload: {json.dumps(data, indent=2)}")
@@ -1791,6 +1838,7 @@ async def diun_webhook(request: Request):
             build_notification_body(
                 server_display, image, container_name,
                 "\n\nℹ️ No automatic deployment: change the tag in Coolify to upgrade."),
+            info=True,
         )
         return JSONResponse({"ok": True, "uuid": uuid, "action": "new-tag-notified"})
 
@@ -1814,7 +1862,10 @@ async def diun_webhook(request: Request):
     title = f"{status_emoji} {container_name} — {available_text}"
     body = build_notification_body(server_display, image, container_name, deploy_link)
 
-    send_notification(apprise_urls, title, body)
+    # Coolify is configured but runs nothing for this image: Diun watches something the
+    # dispatcher cannot act on, which is a problem to look at, not an announcement.
+    unknown_to_coolify = bool(coolify_url and coolify_token) and not uuid
+    send_notification(apprise_urls, title, body, info=not unknown_to_coolify)
 
     return JSONResponse({"ok": True, "uuid": uuid})
 
