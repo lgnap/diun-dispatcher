@@ -14,14 +14,14 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (222 tests, environ 1 s).
+- Tests : `.venv/bin/python -m pytest -q` (235 tests, environ 1 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
 ## Variables d'environnement (noms seulement, voir `.env.sample` et le README)
 Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLIFY_TOKEN`,
 `WEBHOOK_SECRET` (obligatoire). Optionnelles : `AUTO_DEPLOY`, `DEPLOY_DEBOUNCE_SECONDS`,
-`DISPATCHER_URL`, `APPRISE_URLS`, `IGNORE_CONTAINERS`, `SERIES_CHECK_HOUR`, `CACHE_FILE`,
+`DISPATCHER_URL`, `APPRISE_URLS`, `NOTIFY_LEVEL`, `IGNORE_CONTAINERS`, `SERIES_CHECK_HOUR`, `CACHE_FILE`,
 `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`.
 
 ## Conventions
@@ -51,6 +51,10 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   `compose up` simultanés, deux Postgres sur le même répertoire) : verrou tenu jusqu'au
   retour du service et au moins 5 min ; mises à jour regroupées
   (`DEPLOY_DEBOUNCE_SECONDS`) ; `/deploy` refusé pendant un redémarrage.
+- `NOTIFY_LEVEL=failures` ne garde que les échecs (défaut `all`) : tout appel à
+  `send_notification` d'un succès ou d'une annonce doit passer `info=True`, un oubli envoie
+  quand même. Les webhooks refusés (400, 401) et les images inconnues de Coolify sont des
+  échecs ; refus de webhook limité à un message par raison toutes les 10 min.
 - Image de base : reconstruction une à une, arrêt au premier échec, autre majeure = annonce. Ne jamais afficher `WEBHOOK_SECRET` ni le jeton Coolify (ni dans les journaux).
 
 ## Reprise de session
