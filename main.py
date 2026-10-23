@@ -83,7 +83,8 @@ WATCH_TRANSITION_GRACE_SECONDS = 60
 WATCH_STABLE_SECONDS = 30
 # Diun reports every image of a pass within a second or so: wait this long after
 # the first update of a service so that its other images join the same restart.
-DEPLOY_DEBOUNCE_DEFAULT_SECONDS = 10.0
+DEPLOY_DEBOUNCE_DEFAULT_SECONDS = 60.0
+DEPLOY_PAUSE_DEFAULT_SECONDS = 20.0
 # How long a service stays locked after a restart was requested, whatever the
 # watch concluded: with latest=true Coolify first pulls the images while the old
 # containers still report healthy, so "back to its baseline" can be seen before
@@ -245,14 +246,15 @@ def get_env(key: str, required: bool = True) -> str:
 # used to fail its own lookup and send its own notification. Now the first
 # failure says so once and puts the dispatcher on hold: Diun alerts are only
 # remembered (in memory), a probe retries Coolify periodically, and the return is
-# announced once with the list of what was missed. Nothing is deployed
-# afterwards by itself: the user redeploys what the list names.
+# announced once. With AUTO_DEPLOY, the updates missed meanwhile are then
+# redeployed one service at a time, with a pause between two, and reported in a
+# single message at the end; without it, the message lists them.
 # ---------------------------------------------------------------------------
 COOLIFY_DEFAULT_PROBE_SECONDS = 120
 # When Coolify was first found unreachable (None: it answers)
 _coolify_down_since: float | None = None
-# Updates reported while it was down: image -> container name
-_coolify_missed: dict[str, str] = {}
+# Updates reported while it was down: image -> {container, status, hostname}
+_coolify_missed: dict[str, dict] = {}
 
 
 def coolify_is_down() -> bool:
@@ -284,20 +286,23 @@ def _coolify_down(reason: str) -> None:
         load_apprise_urls(),
         "❌ Coolify unreachable — deployments paused",
         f"⚠️ {reason}\n\nUpdates reported by Diun meanwhile are not deployed. The dispatcher "
-        f"retries every {coolify_probe_seconds()} s and sends one message, with the list of "
-        f"what was missed, when Coolify is back.",
+        f"retries every {coolify_probe_seconds()} s and sends one message when Coolify is back.",
     )
     spawn(probe_coolify_until_back())
 
 
-def _coolify_up() -> None:
-    """Coolify answered: if it was down, announce the return once."""
+def _coolify_up(services: list[dict] | None = None) -> None:
+    """Coolify answered: if it was down, announce the return once (or, with
+    AUTO_DEPLOY, replay what was missed and announce it all in one report)."""
     global _coolify_down_since
     if not coolify_is_down():
         return
     _coolify_down_since = None
     missed = dict(_coolify_missed)
     _coolify_missed.clear()
+    if missed and services is not None and is_auto_deploy_enabled():
+        spawn(replay_missed(services, missed))
+        return
     if missed:
         listed = "\n".join(f"• {name}: {image}" for image, name in missed.items())
         body = (f"{len(missed)} update(s) reported meanwhile were not deployed. "
@@ -308,9 +313,44 @@ def _coolify_up() -> None:
                       f"✅ Coolify is back — {len(missed)} update(s) missed", body)
 
 
-def coolify_down_response(container_name: str, image: str) -> JSONResponse:
+async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
+    """Redeploy what Diun reported while Coolify was unreachable, as the webhook would
+    have: only an "update" of the tag in service, one restart per service, one service
+    at a time with a pause between two. One report at the end."""
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    token = os.getenv("COOLIFY_TOKEN", "").strip()
+    groups: dict[str, dict] = {}
+    notes: list[str] = []
+    for image, event in missed.items():
+        name = event["container"]
+        if event["status"] != "update":
+            notes.append(f"• {name}: new version {image_tag(image)} reported, nothing applied")
+            continue
+        matched = find_service_by_image(services, image, name)
+        uuid = matched.get("uuid") if matched else None
+        if not uuid:
+            notes.append(f"• {name}: no Coolify resource runs {image}")
+            continue
+        configured = find_configured_image(matched, image)
+        if configured and image_tag(configured) != image_tag(image):
+            continue  # another series than the one in service: nothing to do
+        hostname = event.get("hostname", "unknown")
+        server = (matched.get("server") or {}).get("name") or hostname.split(".")[0]
+        group = groups.setdefault(uuid, {
+            "containers": [], "images": [], "baseline": matched.get("status", ""),
+            "server": server, "deploy_link": build_deploy_link(uuid)})
+        group["containers"].append(name)
+        group["images"].append(image)
+
+    queue = list(groups.items())
+    rows = await run_redeploys(coolify_url, token, lambda: queue.pop(0) if queue else None)
+    send_redeploy_report(rows, notes, heading="Coolify is back — ", always=True, ok_is_info=False)
+
+
+def coolify_down_response(container_name: str, image: str, status: str = "update",
+                          hostname: str = "unknown") -> JSONResponse:
     """Answer a Diun alert received while Coolify is unreachable: remember it, stay silent."""
-    _coolify_missed[image] = container_name
+    _coolify_missed[image] = {"container": container_name, "status": status, "hostname": hostname}
     logger.info(f"Coolify unreachable, update of {image} ({container_name}) put on the missed list")
     return JSONResponse({"ok": True, "action": "coolify-down"})
 
@@ -344,7 +384,7 @@ async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list
             resp.raise_for_status()
             data = resp.json()
             logger.info(f"✓ Coolify services fetched: {len(data)} service(s)")
-            _coolify_up()
+            _coolify_up(data)
             return data
     except Exception as e:
         logger.error(f"✗ Failed to fetch Coolify services: {e}")
@@ -834,18 +874,28 @@ async def wait_for_service(coolify_url: str, coolify_token: str, uuid: str,
 async def watch_deployment(coolify_url: str, coolify_token: str, uuid: str,
                            baseline_status: str, container_name: str, image: str,
                            server: str, timeout: float = WATCH_TIMEOUT_SECONDS,
-                           grace: float = WATCH_TRANSITION_GRACE_SECONDS) -> None:
+                           grace: float = WATCH_TRANSITION_GRACE_SECONDS,
+                           outcomes: list | None = None) -> None:
     """Follow a redeploy until the resource is back, then notify.
 
     Coolify notifies webhooks for deployments, not for the restart we trigger, so
     the outcome is read from the resource status instead. Success means the status
     left its baseline and came back to it — with the health the baseline had.
+    With `outcomes`, the result is appended there instead of notified (the replay
+    after a Coolify outage reports them all at once).
     """
     back, status, note = await wait_for_service(
         coolify_url, coolify_token, uuid, baseline_status, container_name,
         timeout=timeout, grace=grace)
     if back:
+        if outcomes is not None:
+            outcomes.append((container_name, image, True, f"deployed, status {status}{note}".strip()))
+            return
         _notify_deployment_done(container_name, image, server, status, note)
+        return
+    if outcomes is not None:
+        outcomes.append((container_name, image, False,
+                         f"never came back (last status: {status})"))
         return
     send_notification(
         load_apprise_urls(),
@@ -899,13 +949,103 @@ async def hold_after_restart(uuid: str) -> None:
         await asyncio.sleep(remaining)
 
 
+def deploy_pause_seconds() -> float:
+    """Pause between two services redeployed one after the other."""
+    raw = os.getenv("DEPLOY_PAUSE_SECONDS", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEPLOY_PAUSE_DEFAULT_SECONDS
+    return value if value >= 0 else DEPLOY_PAUSE_DEFAULT_SECONDS
+
+
 def deploy_debounce_seconds() -> float:
+    """The batch window: how long the first update waits for the others of the burst."""
     raw = os.getenv("DEPLOY_DEBOUNCE_SECONDS", "").strip()
     try:
         value = float(raw)
     except ValueError:
         return DEPLOY_DEBOUNCE_DEFAULT_SECONDS
     return value if value >= 0 else DEPLOY_DEBOUNCE_DEFAULT_SECONDS
+
+
+async def run_redeploys(coolify_url: str, coolify_token: str, next_group) -> list[tuple[dict, tuple]]:
+    """Redeploy services one at a time, `deploy_pause_seconds` apart, and collect the
+    outcomes instead of notifying. `next_group()` returns the next (uuid, pending) or
+    None. Returns (pending, outcome) rows."""
+    rows: list[tuple[dict, tuple]] = []
+    first = True
+    while (group := next_group()) is not None:
+        uuid, pending = group
+        if not first:
+            await asyncio.sleep(deploy_pause_seconds())
+        first = False
+        lock = service_restart_lock(uuid)
+        await lock.acquire()
+        if _pending_redeploys.get(uuid) is pending:
+            del _pending_redeploys[uuid]
+        outcomes: list[tuple[str, str, bool, str]] = []
+        try:
+            await _redeploy(coolify_url, coolify_token, uuid, pending, outcomes=outcomes)
+        except Exception as e:
+            logger.exception(f"Redeploy of {pending['containers']} failed")
+            outcomes.append((", ".join(pending["containers"]), ", ".join(pending["images"]),
+                             False, f"{type(e).__name__}: {e}"))
+        finally:
+            spawn(_release_after_hold(uuid, lock))
+        rows.extend((pending, outcome) for outcome in outcomes)
+    return rows
+
+
+def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str], heading: str,
+                         always: bool, ok_is_info: bool) -> None:
+    """The one message that closes a batch of redeploys. `ok_is_info`: an all-good report
+    is an announcement that NOTIFY_LEVEL=failures drops."""
+    if not rows and not notes and not always:
+        return
+    failed = [r for r in rows if not r[1][2]]
+    if failed:
+        title = f"❌ {heading}{len(failed)} of {len(rows)} redeploys failed"
+    elif rows:
+        title = f"✅ {heading}{len(rows)} redeployed"
+    else:
+        title = f"✅ {heading}nothing to redeploy"
+    lines = []
+    for pending, (name, image, ok, detail) in rows:
+        line = f"• {name} ({image}) on {pending['server']}: {'✅' if ok else '❌'} {detail}".rstrip()
+        if not ok and pending.get("deploy_link"):
+            line += pending["deploy_link"]
+        lines.append(line)
+    send_notification(load_apprise_urls(), title,
+                      "\n".join(lines + notes) or "No update was reported meanwhile.",
+                      info=ok_is_info and not failed)
+
+
+# A burst of Diun alerts (one pass of several Diun instances) shares one window: the
+# first update waits `deploy_debounce_seconds`, the services are then redeployed one
+# at a time and a single report closes the batch.
+_batch_queue: list[str] = []
+_batch_running = False
+
+
+async def _run_batch(coolify_url: str, coolify_token: str) -> None:
+    global _batch_running
+    try:
+        await asyncio.sleep(deploy_debounce_seconds())
+
+        def next_group():
+            if not _batch_queue:
+                return None
+            uuid = _batch_queue.pop(0)
+            return uuid, _pending_redeploys[uuid]
+
+        rows = await run_redeploys(coolify_url, coolify_token, next_group)
+        send_redeploy_report(rows, [], heading="", always=False, ok_is_info=True)
+    finally:
+        for uuid in _batch_queue:
+            _pending_redeploys.pop(uuid, None)
+        _batch_queue.clear()
+        _batch_running = False
 
 
 def schedule_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
@@ -936,33 +1076,25 @@ def schedule_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
         "deploy_link": deploy_link,
     }
     _pending_redeploys[uuid] = pending
-    spawn(_run_service_redeploy(coolify_url, coolify_token, uuid, pending))
+    _batch_queue.append(uuid)
+    global _batch_running
+    if not _batch_running:
+        _batch_running = True
+        spawn(_run_batch(coolify_url, coolify_token))
     return "auto-deploy-scheduled"
 
 
-async def _run_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
-                                pending: dict) -> None:
-    try:
-        await asyncio.sleep(deploy_debounce_seconds())
-        async with service_restart_lock(uuid):
-            if _pending_redeploys.get(uuid) is pending:
-                del _pending_redeploys[uuid]
-            try:
-                await _redeploy(coolify_url, coolify_token, uuid, pending)
-            finally:
-                await hold_after_restart(uuid)
-    finally:
-        if _pending_redeploys.get(uuid) is pending:
-            del _pending_redeploys[uuid]
-
-
-async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: dict) -> None:
+async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: dict,
+                    outcomes: list | None = None) -> None:
     containers = ", ".join(pending["containers"])
     images = ", ".join(pending["images"])
     # The listing the webhook saw may date from the middle of another restart
     baseline = await get_service_status(coolify_url, coolify_token, uuid) or pending["baseline"]
     result = await trigger_coolify(coolify_url, coolify_token, uuid)
     if not result["ok"]:
+        if outcomes is not None:
+            outcomes.append((containers, images, False, "auto-deploy could not be triggered"))
+            return
         send_notification(
             load_apprise_urls(),
             f"❌ {containers} — auto-deploy could not be triggered",
@@ -972,9 +1104,10 @@ async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: di
         return
     logger.info(f"Auto-deploy triggered for {containers} (service {uuid}), "
                 f"baseline status={baseline}")
+    extra = {} if outcomes is None else {"outcomes": outcomes}
     await watch_deployment(coolify_url, coolify_token, uuid, baseline,
                            container_name=containers, image=images,
-                           server=pending["server"])
+                           server=pending["server"], **extra)
 
 
 async def _release_when_back(coolify_url: str, coolify_token: str, uuid: str,
@@ -1883,10 +2016,10 @@ async def diun_webhook(request: Request):
     deploy_link = ""
     if coolify_url and coolify_token:
         if coolify_is_down():
-            return coolify_down_response(container_name, image)
+            return coolify_down_response(container_name, image, status, hostname)
         services = await get_coolify_applications(coolify_url, coolify_token)
         if coolify_is_down():
-            return coolify_down_response(container_name, image)
+            return coolify_down_response(container_name, image, status, hostname)
         matched_service = find_service_by_image(services, image, container_name)
         uuid = matched_service.get("uuid") if matched_service else None
         if uuid:
