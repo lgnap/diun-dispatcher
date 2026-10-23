@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import base64
+import html as html_lib
 import os
 import json
 import logging
@@ -662,14 +663,32 @@ def notify_failures_only() -> bool:
     return level == "failures"
 
 
-def send_notification(urls: list[str], title: str, body: str, info: bool = False) -> None:
+def send_notification(urls: list[str], title: str, body: str, info: bool = False,
+                      alt_bodies: dict | None = None) -> None:
     """Send a notification. `info` marks what is not a failure (successes, announcements):
-    NOTIFY_LEVEL=failures drops those. A call that forgets it errs on the side of sending."""
+    NOTIFY_LEVEL=failures drops those. A call that forgets it errs on the side of sending.
+
+    `alt_bodies` maps an Apprise NotifyFormat (HTML, MARKDOWN) to a formatted version of
+    the body: each service gets the one matching its own format (a Pushover URL with
+    `?format=html` shows real bold), the others get the plain `body`."""
     if info and notify_failures_only():
         logger.info(f"NOTIFY_LEVEL=failures, not sending: {title}")
         return
     if not urls:
         logger.warning("No APPRISE_URLS configured, skipping notification")
+        return
+    if alt_bodies:
+        sent = False
+        for url in urls:
+            apobj = apprise.Apprise()
+            apobj.add(url)
+            servers = list(apobj)
+            fmt = servers[0].notify_format if servers else None
+            if fmt in alt_bodies:
+                sent = apobj.notify(title=title, body=alt_bodies[fmt], body_format=fmt) or sent
+            else:
+                sent = apobj.notify(title=title, body=body) or sent
+        logger.info("Notification sent") if sent else logger.error("Notification failed")
         return
     apobj = apprise.Apprise()
     for url in urls:
@@ -1045,7 +1064,7 @@ async def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str],
     else:
         title = f"✅ {heading}nothing to redeploy"
 
-    by_server: dict[str, list[str]] = {}
+    by_server: dict[str, list[tuple[str, str]]] = {}  # server -> [(plain line, html line)]
     remembered = False
     for pending, (name, image, ok, detail) in rows:
         uuid = pending.get("uuid", "")
@@ -1060,19 +1079,33 @@ async def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str],
                 line += f" {detail}".rstrip()
                 if position == len(items) - 1:  # one manual link per service
                     line += pending.get("deploy_link", "")
-            by_server.setdefault(pending.get("server", "unknown"), []).append(line)
+            by_server.setdefault(pending.get("server", "unknown"), []).append(
+                (line, html_lib.escape(line, quote=False)))
             if ok:
                 _image_versions[key] = new
                 remembered = True
     if remembered:
         _save_image_versions()
 
-    lines = [f"**{server}**\n" + "\n".join(items) for server, items in by_server.items()]
-    body = "\n".join(lines)
-    if notes:
-        body += ("\n\n" if body else "") + "Not redeployed:\n" + "\n".join(notes)
-    send_notification(load_apprise_urls(), title, body or "No update was reported meanwhile.",
-                      info=ok_is_info and not failed)
+    plain, markdown, html = [], [], []
+    for server, entries in by_server.items():
+        plain.append("\n".join([server] + [p for p, _ in entries]))
+        markdown.append("\n".join([f"**{server}**"] + [p for p, _ in entries]))
+        html.append("\n".join([f"<b>{html_lib.escape(server, quote=False)}</b>"] + [h for _, h in entries]))
+    tail = ("Not redeployed:\n" + "\n".join(notes)) if notes else ""
+    tail_html = html_lib.escape(tail, quote=False)
+
+    def join(parts, extra):
+        text = "\n".join(parts)
+        text += (("\n\n" if text else "") + extra) if extra else ""
+        return text or "No update was reported meanwhile."
+
+    send_notification(
+        load_apprise_urls(), title,
+        join(plain, tail),
+        info=ok_is_info and not failed,
+        alt_bodies={apprise.NotifyFormat.MARKDOWN: join(markdown, tail),
+                    apprise.NotifyFormat.HTML: join(html, tail_html)})
 
 
 # A burst of Diun alerts (one pass of several Diun instances) shares one window: the

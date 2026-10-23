@@ -5,6 +5,7 @@ import httpx
 from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 from main import app, get_cloudflare_headers, current_image_version as _real_current_image_version
+import apprise
 import pytest
 
 
@@ -3010,7 +3011,11 @@ def test_a_burst_sends_one_report_not_one_notification_per_service():
     title, body = notify.call_args.args[1], notify.call_args.args[2]
     assert "✅" in title and "2 redeployed" in title
     assert "nextcloud" in body and "nginx" in body
-    assert "**server2-prod**" in body and "**server1**" in body
+    assert "server2-prod\n" in body and "server1\n" in body
+    assert "**" not in body and "<b>" not in body, "the plain body carries no markup"
+    alt = notify.call_args.kwargs["alt_bodies"]
+    assert "**server2-prod**" in alt[apprise.NotifyFormat.MARKDOWN]
+    assert "<b>server2-prod</b>" in alt[apprise.NotifyFormat.HTML]
     assert notify.call_args.kwargs.get("info") is True, "NOTIFY_LEVEL=failures drops an all-good report"
 
 
@@ -3058,6 +3063,7 @@ def _report(rows, notes=(), versions=None, published=None):
          patch('main.send_notification') as notify:
         asyncio.run(main.send_redeploy_report(rows, list(notes), heading="", always=False,
                                               ok_is_info=True))
+    _report.alt_bodies = notify.call_args.kwargs.get("alt_bodies")
     return notify.call_args.args[1], notify.call_args.args[2], notify.call_args.kwargs.get("info")
 
 
@@ -3080,13 +3086,18 @@ def test_report_groups_containers_under_their_machine_with_old_and_new_version()
     title, body, info = _report(rows, versions=versions, published=published)
 
     assert body.split("\n") == [
-        "**music-assistant**",
+        "music-assistant",
         " - nextcloud: 34.0.0 ⇒ 34.0.1 ✅",
         " - redis: ? ⇒ 7 ✅",
-        "**boum**",
+        "boum",
         " - gitea: ? ⇒ 1.27.4 ✅",
     ]
     assert title == "✅ 3 redeployed" and info is True
+    markdown = _report.alt_bodies[apprise.NotifyFormat.MARKDOWN].split("\n")
+    assert markdown[0] == "**music-assistant**" and markdown[3] == "**boum**"
+    html = _report.alt_bodies[apprise.NotifyFormat.HTML].split("\n")
+    assert html[0] == "<b>music-assistant</b>" and html[3] == "<b>boum</b>"
+    assert html[1:3] == body.split("\n")[1:3]
 
 
 def test_report_strips_the_service_uuid_from_the_container_name():
@@ -3112,7 +3123,7 @@ def test_report_shows_the_reason_and_the_manual_link_of_a_failure():
 
 def test_report_lists_what_was_not_redeployed_after_the_machines():
     _, body, _ = _report([_row("nextcloud", NEXTCLOUD)], notes=["• gitea: new version 1.28 reported, nothing applied"])
-    assert body.index("**srv1**") < body.index("Not redeployed") < body.index("• gitea")
+    assert body.index("srv1") < body.index("Not redeployed") < body.index("• gitea")
 
 
 def test_report_remembers_the_deployed_version_but_not_after_a_failure():
@@ -3148,3 +3159,54 @@ def test_current_image_version_reads_the_registry_label():
     with patch('main.fetch_image_version', new=AsyncMock(return_value="4.2.1")) as fetch:
         assert asyncio.run(_real_current_image_version("ghcr.io/yeraze/meshmonitor:4")) == "4.2.1"
     fetch.assert_awaited_once_with("ghcr.io/yeraze/meshmonitor:4")
+
+
+def test_report_escapes_markup_in_its_html_version():
+    _, body, _ = _report([_row("<app>", NEXTCLOUD, server="a&b")])
+    assert " - <app>: " in body, "plain text is left alone"
+    html = _report.alt_bodies[apprise.NotifyFormat.HTML]
+    assert "<b>a&amp;b</b>" in html and " - &lt;app&gt;: " in html
+
+
+class _FakeApprise:
+    """Stands for Apprise with one service per URL; `?format=` picks its own format."""
+    calls: list = []
+
+    def __init__(self):
+        self.url = None
+
+    def add(self, url):
+        self.url = url
+
+    def __iter__(self):
+        fmt = {"html": apprise.NotifyFormat.HTML, "markdown": apprise.NotifyFormat.MARKDOWN}.get(
+            self.url.split("format=")[-1] if "format=" in self.url else "", apprise.NotifyFormat.TEXT)
+        return iter([MagicMock(notify_format=fmt)])
+
+    def notify(self, title, body, body_format=None):
+        _FakeApprise.calls.append((self.url, body, body_format))
+        return True
+
+
+def test_each_service_gets_the_body_matching_its_own_format():
+    import main
+    _FakeApprise.calls = []
+    alt = {apprise.NotifyFormat.HTML: "<b>m</b>", apprise.NotifyFormat.MARKDOWN: "**m**"}
+    with patch('main.apprise.Apprise', new=_FakeApprise):
+        main.send_notification(["pover://a?format=html", "ntfy://b?format=markdown", "json://c"],
+                               "t", "m", alt_bodies=alt)
+    assert _FakeApprise.calls == [
+        ("pover://a?format=html", "<b>m</b>", apprise.NotifyFormat.HTML),
+        ("ntfy://b?format=markdown", "**m**", apprise.NotifyFormat.MARKDOWN),
+        ("json://c", "m", None),
+    ]
+
+
+def test_notify_level_failures_also_drops_a_formatted_info_notification():
+    import main
+    _FakeApprise.calls = []
+    with patch.dict(os.environ, {"NOTIFY_LEVEL": "failures"}, clear=True), \
+         patch('main.apprise.Apprise', new=_FakeApprise):
+        main.send_notification(["json://c"], "t", "m", info=True,
+                               alt_bodies={apprise.NotifyFormat.HTML: "<b>m</b>"})
+    assert _FakeApprise.calls == []

@@ -244,6 +244,11 @@ from the name), with the version that was running and the one now deployed:
  - diun: 4.28.0 ⇒ 4.29.0 ❌ never came back (last status: exited)
 ```
 
+The machine name is real **bold**, not `**asterisks**`: each notification service gets the
+body in its own format. A service whose Apprise URL says `?format=html` (or `markdown`)
+receives bold machine names; the others receive plain text. For Pushover, which is plain
+text by default, write the URL as `pover://USER@TOKEN?format=html`.
+
 A failed line carries the reason and the manual deploy link. Versions come from the
 `org.opencontainers.image.version` label of the image published under its tag, or the tag
 itself when the image has no such label. The previous version is the last one the
