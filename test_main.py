@@ -3081,7 +3081,7 @@ def test_report_groups_containers_under_their_machine_with_old_and_new_version()
     rows = [_row("nextcloud-svc-9", NEXTCLOUD, server="music-assistant"),
             _row("redis-svc-9", "docker.io/library/redis:7", server="music-assistant"),
             _row("gitea-svc-8", "docker.io/gitea/gitea:1.27", server="boum", uuid="svc-8")]
-    versions = {main.normalize_image(NEXTCLOUD): "34.0.0"}
+    versions = {main.image_version_key(NEXTCLOUD): "34.0.0"}
     published = {NEXTCLOUD: "34.0.1", "docker.io/gitea/gitea:1.27": "1.27.4"}
     title, body, info = _report(rows, versions=versions, published=published)
 
@@ -3114,7 +3114,7 @@ def test_report_shows_the_reason_and_the_manual_link_of_a_failure():
     rows = [_row("diun", "docker.io/crazymax/diun:4", ok=False,
                  detail="never came back (last status: exited)", link="\n🚀 http://x/deploy?uuid=svc-9")]
     import main
-    title, body, info = _report(rows, versions={main.normalize_image("docker.io/crazymax/diun:4"): "4.28.0"},
+    title, body, info = _report(rows, versions={main.image_version_key("docker.io/crazymax/diun:4"): "4.28.0"},
                                 published={"docker.io/crazymax/diun:4": "4.29.0"})
     assert " - diun: 4.28.0 ⇒ 4.29.0 ❌ never came back (last status: exited)" in body
     assert "/deploy?uuid=svc-9" in body
@@ -3130,12 +3130,12 @@ def test_report_remembers_the_deployed_version_but_not_after_a_failure():
     import main
     ok_rows = [_row("nextcloud", NEXTCLOUD)]
     _report(ok_rows, published={NEXTCLOUD: "34.0.1"})
-    assert main._image_versions[main.normalize_image(NEXTCLOUD)] == "34.0.1"
-    assert json.loads(main.VERSIONS_FILE.read_text()) == {main.normalize_image(NEXTCLOUD): "34.0.1"}
+    assert main._image_versions[main.image_version_key(NEXTCLOUD)] == "34.0.1"
+    assert json.loads(main.VERSIONS_FILE.read_text()) == {main.image_version_key(NEXTCLOUD): "34.0.1"}
 
     _report([_row("nextcloud", NEXTCLOUD, ok=False, detail="boom")],
-            versions={main.normalize_image(NEXTCLOUD): "34.0.1"}, published={NEXTCLOUD: "34.0.2"})
-    assert main._image_versions[main.normalize_image(NEXTCLOUD)] == "34.0.1"
+            versions={main.image_version_key(NEXTCLOUD): "34.0.1"}, published={NEXTCLOUD: "34.0.2"})
+    assert main._image_versions[main.image_version_key(NEXTCLOUD)] == "34.0.1"
 
 
 def test_remembered_versions_survive_a_restart():
@@ -3210,3 +3210,18 @@ def test_notify_level_failures_also_drops_a_formatted_info_notification():
         main.send_notification(["json://c"], "t", "m", info=True,
                                alt_bodies={apprise.NotifyFormat.HTML: "<b>m</b>"})
     assert _FakeApprise.calls == []
+
+
+def test_each_tag_of_a_repository_remembers_its_own_version():
+    import main
+    assert main.image_version_key("docker.io/gitea/gitea:1.26") != main.image_version_key("docker.io/gitea/gitea:1.27")
+    assert main.image_version_key("docker.io/gitea/gitea:1.27") == main.image_version_key("gitea/gitea:1.27")
+    assert main.image_version_key("nextcloud") == main.image_version_key("docker.io/library/nextcloud:latest")
+
+    rows = [_row("gitea-old", "docker.io/gitea/gitea:1.26"), _row("gitea-new", "docker.io/gitea/gitea:1.27")]
+    versions = {main.image_version_key("docker.io/gitea/gitea:1.26"): "1.26.3",
+                main.image_version_key("docker.io/gitea/gitea:1.27"): "1.27.1"}
+    _, body, _ = _report(rows, versions=versions, published={
+        "docker.io/gitea/gitea:1.26": "1.26.4", "docker.io/gitea/gitea:1.27": "1.27.2"})
+    assert " - gitea-old: 1.26.3 ⇒ 1.26.4 ✅" in body
+    assert " - gitea-new: 1.27.1 ⇒ 1.27.2 ✅" in body

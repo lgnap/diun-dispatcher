@@ -1016,6 +1016,12 @@ def _save_image_versions() -> None:
         logger.warning(f"Could not save {VERSIONS_FILE}: {e}")
 
 
+def image_version_key(image: str) -> str:
+    """Where the last deployed version of an image is remembered: repository and tag
+    (two series of one repository, gitea 1.26 and 1.27, have their own)."""
+    return f"{normalize_image(image)}:{image_tag(image)}"
+
+
 async def current_image_version(image: str) -> str | None:
     """The version label of the image now published under its tag, None if unreadable."""
     return await fetch_image_version(image)
@@ -1071,7 +1077,7 @@ async def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str],
         items = pending.get("items") or [(name, image)]
         for position, (container, container_image) in enumerate(items):
             display = container.removesuffix(f"-{uuid}") if uuid else container
-            key = normalize_image(container_image)
+            key = image_version_key(container_image)
             new = (await current_image_version(container_image)) or image_tag(container_image)
             old = _image_versions.get(key, "?")
             line = f" - {display}: {old} ⇒ {new} {'✅' if ok else '❌'}"
