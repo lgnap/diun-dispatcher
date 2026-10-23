@@ -14,7 +14,7 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (257 tests, environ 1 s).
+- Tests : `.venv/bin/python -m pytest -q` (269 tests, environ 1 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
@@ -54,6 +54,11 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   service à la fois (`DEPLOY_PAUSE_SECONDS` entre deux) et UN seul compte rendu (`✅ N` ou
   `❌ K sur N`, info si tout va bien). Ne plus notifier service par service ; la même
   mécanique (`run_redeploys`, `send_redeploy_report`) sert au rejeu après panne de Coolify.
+  Le compte rendu est groupé par machine puis conteneur (`- php: ancienne ⇒ nouvelle ✅`), les
+  versions viennent du label OCI de l'image et sont mémorisées dans `image_versions.json`
+  (à côté de `CACHE_FILE`) ; le nom de machine est en gras réel : `send_notification` prend
+  `alt_bodies` (HTML/Markdown) et envoie à chaque service le corps de son propre format (pour
+  Pushover, `?format=html` dans l'URL Apprise, sinon texte brut) ; en test, `current_image_version` est neutralisée (aucun réseau).
 - `NOTIFY_LEVEL=failures` ne garde que les échecs (défaut `all`) : tout appel à
   `send_notification` d'un succès ou d'une annonce doit passer `info=True`, un oubli envoie
   quand même. Les webhooks refusés (400, 401) et les images inconnues de Coolify sont des
