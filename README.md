@@ -64,13 +64,13 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | Variable              | Default | Description |
 |-----------------------|---------|-------------|
 | `AUTO_DEPLOY`         | `false` | Redeploy matched images automatically instead of only sending a deploy link (`true`/`1`/`yes`/`on`). See [Automatic deployments](#automatic-deployments) |
-| `DEPLOY_DEBOUNCE_SECONDS` | `10` | How long an automatic redeploy waits for the other images of the same service to be reported, so that they share one restart. See [One restart at a time per service](#one-restart-at-a-time-per-service) |
+| `DEPLOY_DEBOUNCE_SECONDS` | `60` | The batch window: the first automatic redeploy waits this long for the other updates of the same Diun burst; they are then redeployed one service at a time and reported in one message. See [Bursts](#bursts-one-window-one-service-at-a-time-one-report) |
+| `DEPLOY_PAUSE_SECONDS` | `20` | Pause between two services redeployed one after the other (a burst, or the replay after a Coolify outage) |
 | `WEBHOOK_SECRET`      | (none)  | Shared secret for webhook validation (validates `X-Diun-Secret` header) |
 | `DISPATCHER_URL`      | (none)  | Your dispatcher URL for manual deploy links in notifications (e.g., `https://dispatcher.example.com`) |
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
 | `NOTIFY_LEVEL`        | `all`   | `all` sends every notification; `failures` keeps only what went wrong (failed or stalled redeploy, failed rebuild or series upgrade, rejected webhook, image unknown to Coolify) and drops successes and announcements. See [Notification format](#notification-format) |
 | `COOLIFY_PROBE_SECONDS` | `120` | While Coolify is unreachable, how often the dispatcher retries it. See [When Coolify is unreachable](#when-coolify-is-unreachable) |
-| `COOLIFY_REPLAY_DELAY_SECONDS` | `20` | After a Coolify outage with `AUTO_DEPLOY`, pause between two services redeployed one after the other. See [When Coolify is unreachable](#when-coolify-is-unreachable) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
 | `SERIES_CHECK_HOUR`   | `5`     | Hour of the day (0-23, container time zone) of the daily virtual series check |
 | `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file |
@@ -149,7 +149,7 @@ The dispatcher handles these automatically — no manual mapping needed.
 
 With `AUTO_DEPLOY=true`, a Diun **`update`** event that matches a Coolify service
 triggers the redeploy by itself — no click needed — after a short wait
-(`DEPLOY_DEBOUNCE_SECONDS`, see below). `IGNORE_CONTAINERS` still wins: an
+(`DEPLOY_DEBOUNCE_SECONDS`, see [Bursts](#bursts-one-window-one-service-at-a-time-one-report)). `IGNORE_CONTAINERS` still wins: an
 ignored container is never deployed automatically.
 
 ### `update` deploys, `new` only informs
@@ -217,12 +217,23 @@ What you get:
 
 | Situation | Notification |
 |-----------|--------------|
-| The service came back to its baseline status | `✅ <container> — deployed`, with the status it came back with |
-| The status never moved (restart finished between two polls) | `✅ <container> — deployed`, 60 s after the redeploy, saying the restart was too quick to observe |
-| Coolify refused the redeploy request | `❌ <container> — auto-deploy could not be triggered`, with a manual deploy link |
-| The service never came back within 15 minutes | `⏱️ <container> — deployment status unknown`, with the last status seen and a manual deploy link |
+| The service came back to its baseline status | `✅ <container> … deployed`, with the status it came back with |
+| The status never moved (restart finished between two polls) | the same line, 60 s after the redeploy, saying the restart was too quick to observe |
+| Coolify refused the redeploy request | `❌ <container> … auto-deploy could not be triggered`, with a manual deploy link |
+| The service never came back within 15 minutes | `❌ <container> … never came back (last status: …)`, with a manual deploy link |
 
-A successful auto-deploy sends **one** notification, once it is over.
+These lines are not sent one by one: they are the lines of the single report that closes
+the batch (below), titled `✅ N redeployed` or `❌ K of N redeploys failed`.
+
+### Bursts: one window, one service at a time, one report
+
+Several Diun instances usually report within seconds of each other. The first automatic
+redeploy opens a window of `DEPLOY_DEBOUNCE_SECONDS` (default 60); every update arriving
+meanwhile joins it. The services are then redeployed **one at a time**, each followed by
+the wait until it is back, `DEPLOY_PAUSE_SECONDS` (default 20) apart, and **one report**
+closes the batch, with one line per service (container, image, server, outcome). A failure
+does not stop the next services. With `NOTIFY_LEVEL=failures`, the report is only sent if
+something failed.
 
 ### One restart at a time per service
 
@@ -469,7 +480,7 @@ send one notification per Diun alert:
 3. Every `COOLIFY_PROBE_SECONDS` (default 120) the dispatcher retries Coolify.
 4. When it answers, the updates reported meanwhile are handled as the webhook would have:
    - with `AUTO_DEPLOY`, an `update` of the tag in service is redeployed, one service at a time
-     (a service with several missed images restarts once), `COOLIFY_REPLAY_DELAY_SECONDS`
+     (a service with several missed images restarts once), `DEPLOY_PAUSE_SECONDS`
      apart. A `new` tag, an image unknown to Coolify and an update of another tag are not
      deployed. One single report at the end lists every outcome
      (`✅ Coolify is back — 3 redeployed`, or `❌ … 1 of 3 redeploys failed` with the reason);

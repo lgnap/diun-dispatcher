@@ -542,8 +542,8 @@ def test_webhook_notifies_with_manual_link_when_trigger_fails(mock_coolify, mock
     mock_notify.assert_called_once()
     title = mock_notify.call_args.args[1]
     body = mock_notify.call_args.args[2]
-    assert "nextcloud" in title
     assert "\u274c" in title, "an auto-deploy that could not be triggered must read as a failure"
+    assert "nextcloud" in body and "could not be triggered" in body
     assert "/deploy?uuid=" in body
 
 
@@ -2034,12 +2034,14 @@ def test_base_event_refused_without_webhook_secret():
 # overlapping "compose up" left two database containers on one data directory.
 # ---------------------------------------------------------------------------
 
-NO_DEBOUNCE_ENV = {**AUTO_DEPLOY_ENV, "DEPLOY_DEBOUNCE_SECONDS": "0"}
+NO_DEBOUNCE_ENV = {**AUTO_DEPLOY_ENV, "DEPLOY_DEBOUNCE_SECONDS": "0", "DEPLOY_PAUSE_SECONDS": "0"}
 
 
 def _reset_redeploy_state():
     import main
     main._pending_redeploys.clear()
+    main._batch_queue.clear()
+    main._batch_running = False
     main._service_restart_locks.clear()
     main._last_restart_request.clear()
 
@@ -2055,7 +2057,8 @@ def _post_webhooks(events, env=NO_DEBOUNCE_ENV):
                      for e in events]
 
         async def run_all():
-            await asyncio.gather(*spawned)
+            while spawned:
+                await spawned.pop(0)
 
         asyncio.run(run_all())
     return responses
@@ -2088,7 +2091,7 @@ def test_service_restart_lock_is_per_service():
 
 
 @pytest.mark.parametrize("value, expected", [
-    (None, 10.0), ("0", 0.0), ("2.5", 2.5), ("-1", 10.0), ("soon", 10.0),
+    (None, 60.0), ("0", 0.0), ("2.5", 2.5), ("-1", 60.0), ("soon", 60.0),
 ])
 def test_deploy_debounce_seconds(value, expected):
     import main
@@ -2163,7 +2166,7 @@ def test_update_during_a_restart_restarts_again_afterwards_never_at_once():
             while any(not t.done() for t in spawned):
                 await asyncio.gather(*spawned)
 
-    with patch.dict(os.environ, {"DEPLOY_DEBOUNCE_SECONDS": "0"}, clear=True), \
+    with patch.dict(os.environ, {"DEPLOY_DEBOUNCE_SECONDS": "0", "DEPLOY_PAUSE_SECONDS": "0"}, clear=True), \
          patch("main.trigger_coolify", new=trigger), \
          patch("main.watch_deployment", new=watch), \
          patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")):
@@ -2221,7 +2224,9 @@ def test_merged_redeploy_that_cannot_be_triggered_is_notified_once(mock_coolify,
     mock_watch.assert_not_awaited()
     mock_notify.assert_called_once()
     title, body = mock_notify.call_args.args[1], mock_notify.call_args.args[2]
-    assert "❌" in title and "nginx-svc-2" in title and "php-svc-2" in title
+    assert "❌" in title and "1 of 1" in title
+    assert "nginx-svc-2" in body and "php-svc-2" in body
+    assert "could not be triggered" in body
     assert "/deploy?uuid=" in body
 
 
@@ -2379,7 +2384,7 @@ def test_restart_lock_is_held_after_a_quick_watch():
                                            "nginx-svc-2", "app-nginx:latest", "server1", "")
             await asyncio.gather(*spawned)
 
-    with patch.dict(os.environ, {"DEPLOY_DEBOUNCE_SECONDS": "0"}, clear=True), \
+    with patch.dict(os.environ, {"DEPLOY_DEBOUNCE_SECONDS": "0", "DEPLOY_PAUSE_SECONDS": "0"}, clear=True), \
          patch("main.trigger_coolify", new=trigger), \
          patch("main.watch_deployment", new=watch), \
          patch("main.hold_after_restart", new=hold), \
@@ -2526,7 +2531,8 @@ def test_webhook_announcements_are_info_and_failed_trigger_is_not(mock_coolify, 
     mock_notify.reset_mock()
     _post_webhooks([DIUN_PAYLOAD])
     mock_notify.assert_called_once()
-    assert "could not be triggered" in mock_notify.call_args.args[1]
+    assert "\u274c" in mock_notify.call_args.args[1]
+    assert "could not be triggered" in mock_notify.call_args.args[2]
     assert not mock_notify.call_args.kwargs.get("info")
 
 
@@ -2815,7 +2821,7 @@ def _replay(missed, services, outcomes_by_uuid=None, env=None):
 
     main._service_restart_locks.clear()
     env = {"COOLIFY_API_URL": "http://coolify", "COOLIFY_TOKEN": "t", "AUTO_DEPLOY": "true",
-           "COOLIFY_REPLAY_DELAY_SECONDS": "15", **(env or {})}
+           "DEPLOY_PAUSE_SECONDS": "15", **(env or {})}
     with patch.dict(os.environ, env, clear=True), \
          patch('main._redeploy', new=fake_redeploy), \
          patch('main._release_after_hold', new=release), \
@@ -2927,8 +2933,94 @@ def test_watch_collects_success_and_failure_instead_of_notifying():
 def test_replay_delay_defaults_and_accepts_zero():
     import main
     with patch.dict(os.environ, {}, clear=True):
-        assert main.coolify_replay_delay_seconds() == 20
-    with patch.dict(os.environ, {"COOLIFY_REPLAY_DELAY_SECONDS": "0"}, clear=True):
-        assert main.coolify_replay_delay_seconds() == 0
-    with patch.dict(os.environ, {"COOLIFY_REPLAY_DELAY_SECONDS": "abc"}, clear=True):
-        assert main.coolify_replay_delay_seconds() == 20
+        assert main.deploy_pause_seconds() == 20
+    with patch.dict(os.environ, {"DEPLOY_PAUSE_SECONDS": "0"}, clear=True):
+        assert main.deploy_pause_seconds() == 0
+    with patch.dict(os.environ, {"DEPLOY_PAUSE_SECONDS": "abc"}, clear=True):
+        assert main.deploy_pause_seconds() == 20
+
+
+# ============================================================================
+# A burst of Diun alerts: one window, one service at a time, one report
+# ============================================================================
+
+def _burst(events, services, outcomes_by_uuid=None, env=None, window_sleeps=None):
+    """Post the events, then run the batch they started with fake redeploys."""
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    sleeps, order = [], []
+    outcomes_by_uuid = outcomes_by_uuid or {}
+
+    async def fake_redeploy(url, token, uuid, pending, outcomes=None):
+        order.append((uuid, list(pending["containers"])))
+        ok, detail = outcomes_by_uuid.get(uuid, (True, "running:healthy"))
+        outcomes.append((", ".join(pending["containers"]), ", ".join(pending["images"]), ok, detail))
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    async def release(uuid, lock):
+        lock.release()
+
+    spawned = []
+    env = {**AUTO_DEPLOY_ENV, "DEPLOY_PAUSE_SECONDS": "15", **(env or {})}
+    with patch.dict(os.environ, env, clear=True), \
+         patch('main.get_coolify_applications', new=AsyncMock(return_value=services)), \
+         patch("main.spawn", new=lambda coro: spawned.append(coro)), \
+         patch('main._redeploy', new=fake_redeploy), \
+         patch('main._release_after_hold', new=release), \
+         patch('main.asyncio.sleep', new=sleep), \
+         patch('main.send_notification') as notify:
+        responses = [client.post("/webhook", json=e, headers={"X-Diun-Secret": "s3cret"}) for e in events]
+
+        async def run_all():
+            while spawned:
+                await spawned.pop(0)
+        asyncio.run(run_all())
+    return responses, order, sleeps, notify
+
+
+def test_a_burst_waits_one_window_then_redeploys_one_service_at_a_time():
+    responses, order, sleeps, notify = _burst(
+        [DIUN_PAYLOAD, NGINX_EVENT], [MATCHING_SERVICE, TWO_IMAGE_SERVICE])
+
+    assert [r.json()["action"] for r in responses] == ["auto-deploy-scheduled"] * 2
+    assert [o[0] for o in order] == ["svc-1", "svc-2"]
+    assert sleeps == [60.0, 15.0], "one 60 s window for the whole burst, then a pause between services"
+
+
+def test_a_burst_sends_one_report_not_one_notification_per_service():
+    _, _, _, notify = _burst([DIUN_PAYLOAD, NGINX_EVENT], [MATCHING_SERVICE, TWO_IMAGE_SERVICE])
+
+    notify.assert_called_once()
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "✅" in title and "2 redeployed" in title
+    assert "nextcloud" in body and "nginx-svc-2" in body
+    assert "server2-prod" in body and "server1" in body
+    assert notify.call_args.kwargs.get("info") is True, "NOTIFY_LEVEL=failures drops an all-good report"
+
+
+def test_a_burst_report_is_a_failure_when_one_service_failed():
+    _, order, _, notify = _burst(
+        [DIUN_PAYLOAD, NGINX_EVENT], [MATCHING_SERVICE, TWO_IMAGE_SERVICE],
+        {"svc-1": (False, "never came back (last status: exited)")})
+
+    assert len(order) == 2, "a failure does not stop the next services"
+    notify.assert_called_once()
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "❌" in title and "1 of 2" in title
+    assert "never came back" in body
+    assert not notify.call_args.kwargs.get("info")
+
+
+def test_a_lone_update_is_reported_the_same_way():
+    _, order, sleeps, notify = _burst([DIUN_PAYLOAD], [MATCHING_SERVICE])
+    assert len(order) == 1 and sleeps == [60.0]
+    assert "1 redeployed" in notify.call_args.args[1]
+
+
+def test_the_batch_window_can_be_set():
+    _, _, sleeps, _ = _burst([DIUN_PAYLOAD], [MATCHING_SERVICE], env={"DEPLOY_DEBOUNCE_SECONDS": "5"})
+    assert sleeps == [5.0]
+

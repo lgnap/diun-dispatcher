@@ -83,7 +83,8 @@ WATCH_TRANSITION_GRACE_SECONDS = 60
 WATCH_STABLE_SECONDS = 30
 # Diun reports every image of a pass within a second or so: wait this long after
 # the first update of a service so that its other images join the same restart.
-DEPLOY_DEBOUNCE_DEFAULT_SECONDS = 10.0
+DEPLOY_DEBOUNCE_DEFAULT_SECONDS = 60.0
+DEPLOY_PAUSE_DEFAULT_SECONDS = 20.0
 # How long a service stays locked after a restart was requested, whatever the
 # watch concluded: with latest=true Coolify first pulls the images while the old
 # containers still report healthy, so "back to its baseline" can be seen before
@@ -252,7 +253,6 @@ def get_env(key: str, required: bool = True) -> str:
 COOLIFY_DEFAULT_PROBE_SECONDS = 120
 # When Coolify was first found unreachable (None: it answers)
 _coolify_down_since: float | None = None
-COOLIFY_DEFAULT_REPLAY_DELAY_SECONDS = 20
 # Updates reported while it was down: image -> {container, status, hostname}
 _coolify_missed: dict[str, dict] = {}
 
@@ -274,15 +274,6 @@ def coolify_probe_seconds() -> int:
                        f"using {COOLIFY_DEFAULT_PROBE_SECONDS}")
         return COOLIFY_DEFAULT_PROBE_SECONDS
     return seconds
-
-
-def coolify_replay_delay_seconds() -> float:
-    raw = os.getenv("COOLIFY_REPLAY_DELAY_SECONDS", "").strip()
-    try:
-        value = float(raw)
-    except ValueError:
-        return COOLIFY_DEFAULT_REPLAY_DELAY_SECONDS
-    return value if value >= 0 else COOLIFY_DEFAULT_REPLAY_DELAY_SECONDS
 
 
 def _coolify_down(reason: str) -> None:
@@ -351,30 +342,9 @@ async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
         group["containers"].append(name)
         group["images"].append(image)
 
-    outcomes: list[tuple[str, str, bool, str]] = []
-    for position, (uuid, pending) in enumerate(groups.items()):
-        if position:
-            await asyncio.sleep(coolify_replay_delay_seconds())
-        lock = service_restart_lock(uuid)
-        await lock.acquire()
-        try:
-            await _redeploy(coolify_url, token, uuid, pending, outcomes=outcomes)
-        except Exception as e:
-            logger.exception(f"Replay of {pending['containers']} failed")
-            outcomes.append((", ".join(pending["containers"]), ", ".join(pending["images"]),
-                             False, f"{type(e).__name__}: {e}"))
-        finally:
-            spawn(_release_after_hold(uuid, lock))
-
-    failed = [o for o in outcomes if not o[2]]
-    if failed:
-        title = f"❌ Coolify is back — {len(failed)} of {len(outcomes)} redeploys failed"
-    elif outcomes:
-        title = f"✅ Coolify is back — {len(outcomes)} redeployed"
-    else:
-        title = "✅ Coolify is back — nothing to redeploy"
-    lines = [f"• {name}: {'✅' if ok else '❌'} {detail}".rstrip() for name, _, ok, detail in outcomes]
-    send_notification(load_apprise_urls(), title, "\n".join(lines + notes) or "No update was reported meanwhile.")
+    queue = list(groups.items())
+    rows = await run_redeploys(coolify_url, token, lambda: queue.pop(0) if queue else None)
+    send_redeploy_report(rows, notes, heading="Coolify is back — ", always=True, ok_is_info=False)
 
 
 def coolify_down_response(container_name: str, image: str, status: str = "update",
@@ -979,13 +949,103 @@ async def hold_after_restart(uuid: str) -> None:
         await asyncio.sleep(remaining)
 
 
+def deploy_pause_seconds() -> float:
+    """Pause between two services redeployed one after the other."""
+    raw = os.getenv("DEPLOY_PAUSE_SECONDS", "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEPLOY_PAUSE_DEFAULT_SECONDS
+    return value if value >= 0 else DEPLOY_PAUSE_DEFAULT_SECONDS
+
+
 def deploy_debounce_seconds() -> float:
+    """The batch window: how long the first update waits for the others of the burst."""
     raw = os.getenv("DEPLOY_DEBOUNCE_SECONDS", "").strip()
     try:
         value = float(raw)
     except ValueError:
         return DEPLOY_DEBOUNCE_DEFAULT_SECONDS
     return value if value >= 0 else DEPLOY_DEBOUNCE_DEFAULT_SECONDS
+
+
+async def run_redeploys(coolify_url: str, coolify_token: str, next_group) -> list[tuple[dict, tuple]]:
+    """Redeploy services one at a time, `deploy_pause_seconds` apart, and collect the
+    outcomes instead of notifying. `next_group()` returns the next (uuid, pending) or
+    None. Returns (pending, outcome) rows."""
+    rows: list[tuple[dict, tuple]] = []
+    first = True
+    while (group := next_group()) is not None:
+        uuid, pending = group
+        if not first:
+            await asyncio.sleep(deploy_pause_seconds())
+        first = False
+        lock = service_restart_lock(uuid)
+        await lock.acquire()
+        if _pending_redeploys.get(uuid) is pending:
+            del _pending_redeploys[uuid]
+        outcomes: list[tuple[str, str, bool, str]] = []
+        try:
+            await _redeploy(coolify_url, coolify_token, uuid, pending, outcomes=outcomes)
+        except Exception as e:
+            logger.exception(f"Redeploy of {pending['containers']} failed")
+            outcomes.append((", ".join(pending["containers"]), ", ".join(pending["images"]),
+                             False, f"{type(e).__name__}: {e}"))
+        finally:
+            spawn(_release_after_hold(uuid, lock))
+        rows.extend((pending, outcome) for outcome in outcomes)
+    return rows
+
+
+def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str], heading: str,
+                         always: bool, ok_is_info: bool) -> None:
+    """The one message that closes a batch of redeploys. `ok_is_info`: an all-good report
+    is an announcement that NOTIFY_LEVEL=failures drops."""
+    if not rows and not notes and not always:
+        return
+    failed = [r for r in rows if not r[1][2]]
+    if failed:
+        title = f"❌ {heading}{len(failed)} of {len(rows)} redeploys failed"
+    elif rows:
+        title = f"✅ {heading}{len(rows)} redeployed"
+    else:
+        title = f"✅ {heading}nothing to redeploy"
+    lines = []
+    for pending, (name, image, ok, detail) in rows:
+        line = f"• {name} ({image}) on {pending['server']}: {'✅' if ok else '❌'} {detail}".rstrip()
+        if not ok and pending.get("deploy_link"):
+            line += pending["deploy_link"]
+        lines.append(line)
+    send_notification(load_apprise_urls(), title,
+                      "\n".join(lines + notes) or "No update was reported meanwhile.",
+                      info=ok_is_info and not failed)
+
+
+# A burst of Diun alerts (one pass of several Diun instances) shares one window: the
+# first update waits `deploy_debounce_seconds`, the services are then redeployed one
+# at a time and a single report closes the batch.
+_batch_queue: list[str] = []
+_batch_running = False
+
+
+async def _run_batch(coolify_url: str, coolify_token: str) -> None:
+    global _batch_running
+    try:
+        await asyncio.sleep(deploy_debounce_seconds())
+
+        def next_group():
+            if not _batch_queue:
+                return None
+            uuid = _batch_queue.pop(0)
+            return uuid, _pending_redeploys[uuid]
+
+        rows = await run_redeploys(coolify_url, coolify_token, next_group)
+        send_redeploy_report(rows, [], heading="", always=False, ok_is_info=True)
+    finally:
+        for uuid in _batch_queue:
+            _pending_redeploys.pop(uuid, None)
+        _batch_queue.clear()
+        _batch_running = False
 
 
 def schedule_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
@@ -1016,24 +1076,12 @@ def schedule_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
         "deploy_link": deploy_link,
     }
     _pending_redeploys[uuid] = pending
-    spawn(_run_service_redeploy(coolify_url, coolify_token, uuid, pending))
+    _batch_queue.append(uuid)
+    global _batch_running
+    if not _batch_running:
+        _batch_running = True
+        spawn(_run_batch(coolify_url, coolify_token))
     return "auto-deploy-scheduled"
-
-
-async def _run_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
-                                pending: dict) -> None:
-    try:
-        await asyncio.sleep(deploy_debounce_seconds())
-        async with service_restart_lock(uuid):
-            if _pending_redeploys.get(uuid) is pending:
-                del _pending_redeploys[uuid]
-            try:
-                await _redeploy(coolify_url, coolify_token, uuid, pending)
-            finally:
-                await hold_after_restart(uuid)
-    finally:
-        if _pending_redeploys.get(uuid) is pending:
-            del _pending_redeploys[uuid]
 
 
 async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: dict,
