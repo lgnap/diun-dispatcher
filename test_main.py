@@ -2600,3 +2600,179 @@ def test_webhook_without_coolify_configured_stays_an_announcement(mock_notify):
     with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
         client.post("/webhook?secret=s3cret", json=DIUN_PAYLOAD)
     assert mock_notify.call_args.kwargs.get("info") is True
+
+
+# ============================================================================
+# Coolify unreachable: one notification, pause, one notification on return
+# ============================================================================
+
+def _reset_coolify_state():
+    import main
+    main._coolify_down_since = None
+    main._coolify_missed.clear()
+
+
+def _failing_coolify_client(exc=None):
+    """An httpx.AsyncClient whose GET fails like a cut tunnel (HTTP 530)."""
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock(side_effect=exc or httpx.HTTPStatusError(
+        "Server error '530'", request=MagicMock(), response=MagicMock(status_code=530)))
+    http_client = MagicMock()
+    http_client.get = AsyncMock(return_value=resp)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=http_client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm)
+
+
+def _working_coolify_client(services):
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=services)
+    http_client = MagicMock()
+    http_client.get = AsyncMock(return_value=resp)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=http_client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm)
+
+
+def _list_services(client):
+    import asyncio
+    import main
+    with patch('main.httpx.AsyncClient', new=client):
+        return asyncio.run(main.get_coolify_applications("http://coolify", "tok"))
+
+
+@patch('main.send_notification')
+def test_first_coolify_failure_notifies_once_and_marks_it_down(mock_notify):
+    import main
+    _reset_coolify_state()
+    with patch('main.spawn') as spawn:
+        spawn.side_effect = lambda coro: coro.close()
+        assert _list_services(_failing_coolify_client()) == []
+        assert _list_services(_failing_coolify_client()) == []
+    assert main.coolify_is_down()
+    mock_notify.assert_called_once()
+    title = mock_notify.call_args.args[1]
+    assert "❌" in title and "Coolify unreachable" in title
+    assert not mock_notify.call_args.kwargs.get("info")
+    assert spawn.call_count == 1, "one probe task, not one per failure"
+
+
+@patch('main.send_notification')
+def test_coolify_back_notifies_once_and_lists_what_was_missed(mock_notify):
+    import main
+    _reset_coolify_state()
+    with patch('main.spawn') as spawn:
+        spawn.side_effect = lambda coro: coro.close()
+        _list_services(_failing_coolify_client())
+    main._coolify_missed["docker.io/library/nextcloud:34-apache"] = "nextcloud"
+    mock_notify.reset_mock()
+
+    assert _list_services(_working_coolify_client([MATCHING_SERVICE])) == [MATCHING_SERVICE]
+    assert not main.coolify_is_down()
+    mock_notify.assert_called_once()
+    title, body = mock_notify.call_args.args[1], mock_notify.call_args.args[2]
+    assert "✅" in title and "back" in title
+    assert "nextcloud" in body and "34-apache" in body
+    assert main._coolify_missed == {}
+
+    mock_notify.reset_mock()  # a later success says nothing more
+    _list_services(_working_coolify_client([MATCHING_SERVICE]))
+    mock_notify.assert_not_called()
+
+
+@patch('main.send_notification')
+def test_coolify_back_without_missed_updates_still_says_so(mock_notify):
+    _reset_coolify_state()
+    with patch('main.spawn') as spawn:
+        spawn.side_effect = lambda coro: coro.close()
+        _list_services(_failing_coolify_client())
+    mock_notify.reset_mock()
+    _list_services(_working_coolify_client([]))
+    mock_notify.assert_called_once()
+    assert "no update" in mock_notify.call_args.args[2].lower()
+
+
+@patch('main.send_notification')
+@patch('main.get_coolify_applications', new_callable=AsyncMock)
+def test_webhook_while_coolify_is_down_is_queued_without_calling_coolify_or_notifying(mock_coolify, mock_notify):
+    import main
+    _reset_coolify_state()
+    main._coolify_down_since = 1000.0
+    with patch.dict(os.environ, {**AUTO_DEPLOY_ENV}, clear=True):
+        resp = client.post("/webhook?secret=s3cret", json=DIUN_PAYLOAD)
+        client.post("/webhook?secret=s3cret", json=DIUN_PAYLOAD)  # same image twice
+    assert resp.status_code == 200
+    assert resp.json()["action"] == "coolify-down"
+    mock_coolify.assert_not_awaited()
+    mock_notify.assert_not_called()
+    assert main._coolify_missed == {"docker.io/library/nextcloud:34-apache": "nextcloud"}
+    _reset_coolify_state()
+
+
+@patch('main.send_notification')
+def test_webhook_whose_listing_fails_is_queued_not_announced_as_unknown(mock_notify):
+    import main
+    _reset_coolify_state()
+    with patch.dict(os.environ, {**AUTO_DEPLOY_ENV}, clear=True), \
+         patch('main.httpx.AsyncClient', new=_failing_coolify_client()), \
+         patch('main.spawn') as spawn:
+        spawn.side_effect = lambda coro: coro.close()
+        resp = client.post("/webhook?secret=s3cret", json=DIUN_PAYLOAD)
+    assert resp.json()["action"] == "coolify-down"
+    mock_notify.assert_called_once()
+    assert "Coolify unreachable" in mock_notify.call_args.args[1]
+    assert "no deploy available" not in mock_notify.call_args.args[1]
+    assert "nextcloud" in main._coolify_missed.values()
+    _reset_coolify_state()
+
+
+def test_probe_retries_on_a_simulated_clock_until_coolify_answers():
+    import asyncio
+    import main
+    _reset_coolify_state()
+    main._coolify_down_since = 1000.0
+    sleeps = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    outcomes = [[], [], [MATCHING_SERVICE]]
+
+    async def listing(*args):
+        result = outcomes.pop(0)
+        if result:
+            main._coolify_up()
+        return result
+
+    with patch.dict(os.environ, {"COOLIFY_API_URL": "http://coolify", "COOLIFY_TOKEN": "t",
+                                 "COOLIFY_PROBE_SECONDS": "30"}, clear=True), \
+         patch('main.asyncio.sleep', new=sleep), \
+         patch('main.get_coolify_applications', new=AsyncMock(side_effect=listing)), \
+         patch('main.send_notification'):
+        asyncio.run(main.probe_coolify_until_back())
+    assert sleeps == [30, 30, 30]
+    assert not main.coolify_is_down()
+
+
+def test_probe_interval_defaults_and_rejects_nonsense():
+    import main
+    with patch.dict(os.environ, {}, clear=True):
+        assert main.coolify_probe_seconds() == 120
+    for bad in ("abc", "0", "-5"):
+        with patch.dict(os.environ, {"COOLIFY_PROBE_SECONDS": bad}, clear=True):
+            assert main.coolify_probe_seconds() == 120
+
+
+@patch('main.get_coolify_applications', new_callable=AsyncMock)
+def test_series_check_is_skipped_while_coolify_is_down(mock_coolify):
+    import asyncio
+    import main
+    _reset_coolify_state()
+    main._coolify_down_since = 1000.0
+    with patch.dict(os.environ, {"COOLIFY_API_URL": "http://coolify", "COOLIFY_TOKEN": "t"}, clear=True):
+        asyncio.run(main.run_series_check())
+    mock_coolify.assert_not_awaited()
+    _reset_coolify_state()

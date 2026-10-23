@@ -238,6 +238,92 @@ def get_env(key: str, required: bool = True) -> str:
     return val
 
 
+# ---------------------------------------------------------------------------
+# Coolify unreachable
+#
+# When Coolify cannot be reached (tunnel cut, instance down), every Diun alert
+# used to fail its own lookup and send its own notification. Now the first
+# failure says so once and puts the dispatcher on hold: Diun alerts are only
+# remembered (in memory), a probe retries Coolify periodically, and the return is
+# announced once with the list of what was missed. Nothing is deployed
+# afterwards by itself: the user redeploys what the list names.
+# ---------------------------------------------------------------------------
+COOLIFY_DEFAULT_PROBE_SECONDS = 120
+# When Coolify was first found unreachable (None: it answers)
+_coolify_down_since: float | None = None
+# Updates reported while it was down: image -> container name
+_coolify_missed: dict[str, str] = {}
+
+
+def coolify_is_down() -> bool:
+    return _coolify_down_since is not None
+
+
+def coolify_probe_seconds() -> int:
+    raw = os.getenv("COOLIFY_PROBE_SECONDS", "").strip()
+    if not raw:
+        return COOLIFY_DEFAULT_PROBE_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        logger.warning(f"COOLIFY_PROBE_SECONDS={raw} is not a positive number, "
+                       f"using {COOLIFY_DEFAULT_PROBE_SECONDS}")
+        return COOLIFY_DEFAULT_PROBE_SECONDS
+    return seconds
+
+
+def _coolify_down(reason: str) -> None:
+    """Coolify did not answer: the first time, say so once and start probing."""
+    global _coolify_down_since
+    if coolify_is_down():
+        return
+    _coolify_down_since = time.time()
+    send_notification(
+        load_apprise_urls(),
+        "❌ Coolify unreachable — deployments paused",
+        f"⚠️ {reason}\n\nUpdates reported by Diun meanwhile are not deployed. The dispatcher "
+        f"retries every {coolify_probe_seconds()} s and sends one message, with the list of "
+        f"what was missed, when Coolify is back.",
+    )
+    spawn(probe_coolify_until_back())
+
+
+def _coolify_up() -> None:
+    """Coolify answered: if it was down, announce the return once."""
+    global _coolify_down_since
+    if not coolify_is_down():
+        return
+    _coolify_down_since = None
+    missed = dict(_coolify_missed)
+    _coolify_missed.clear()
+    if missed:
+        listed = "\n".join(f"• {name}: {image}" for image, name in missed.items())
+        body = (f"{len(missed)} update(s) reported meanwhile were not deployed. "
+                f"Redeploy them if needed:\n{listed}")
+    else:
+        body = "No update was reported meanwhile."
+    send_notification(load_apprise_urls(),
+                      f"✅ Coolify is back — {len(missed)} update(s) missed", body)
+
+
+def coolify_down_response(container_name: str, image: str) -> JSONResponse:
+    """Answer a Diun alert received while Coolify is unreachable: remember it, stay silent."""
+    _coolify_missed[image] = container_name
+    logger.info(f"Coolify unreachable, update of {image} ({container_name}) put on the missed list")
+    return JSONResponse({"ok": True, "action": "coolify-down"})
+
+
+async def probe_coolify_until_back() -> None:
+    """Retry Coolify until it answers (the listing itself announces the return)."""
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    token = os.getenv("COOLIFY_TOKEN", "").strip()
+    while coolify_is_down():
+        await asyncio.sleep(coolify_probe_seconds())
+        await get_coolify_applications(coolify_url, token)
+
+
 async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list[dict]:
     """Fetch all services/applications from Coolify API"""
     url = f"{coolify_url.rstrip('/')}/api/v1/services"
@@ -258,9 +344,11 @@ async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list
             resp.raise_for_status()
             data = resp.json()
             logger.info(f"✓ Coolify services fetched: {len(data)} service(s)")
+            _coolify_up()
             return data
     except Exception as e:
         logger.error(f"✗ Failed to fetch Coolify services: {e}")
+        _coolify_down(f"Coolify did not answer: {e}")
         return []
 
 
@@ -1634,7 +1722,12 @@ async def run_series_check() -> None:
     if not coolify_url or not token:
         logger.warning("Series check skipped: Coolify not configured")
         return
+    if coolify_is_down():
+        logger.warning("Series check skipped: Coolify is unreachable")
+        return
     services = await get_coolify_applications(coolify_url, token)
+    if coolify_is_down():
+        return
     if services and not any(s.get("docker_compose_raw") for s in services):
         logger.warning("Series check: Coolify hides every compose, "
                        "COOLIFY_TOKEN needs the read:sensitive permission")
@@ -1789,7 +1882,11 @@ async def diun_webhook(request: Request):
     matched_service = None
     deploy_link = ""
     if coolify_url and coolify_token:
+        if coolify_is_down():
+            return coolify_down_response(container_name, image)
         services = await get_coolify_applications(coolify_url, coolify_token)
+        if coolify_is_down():
+            return coolify_down_response(container_name, image)
         matched_service = find_service_by_image(services, image, container_name)
         uuid = matched_service.get("uuid") if matched_service else None
         if uuid:
