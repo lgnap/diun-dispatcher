@@ -14,14 +14,14 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (243 tests, environ 1 s).
+- Tests : `.venv/bin/python -m pytest -q` (252 tests, environ 1 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
 ## Variables d'environnement (noms seulement, voir `.env.sample` et le README)
 Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLIFY_TOKEN`,
 `WEBHOOK_SECRET` (obligatoire). Optionnelles : `AUTO_DEPLOY`, `DEPLOY_DEBOUNCE_SECONDS`,
-`DISPATCHER_URL`, `APPRISE_URLS`, `NOTIFY_LEVEL`, `COOLIFY_PROBE_SECONDS`, `IGNORE_CONTAINERS`, `SERIES_CHECK_HOUR`, `CACHE_FILE`,
+`DISPATCHER_URL`, `APPRISE_URLS`, `NOTIFY_LEVEL`, `COOLIFY_PROBE_SECONDS`, `COOLIFY_REPLAY_DELAY_SECONDS`, `IGNORE_CONTAINERS`, `SERIES_CHECK_HOUR`, `CACHE_FILE`,
 `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`.
 
 ## Conventions
@@ -56,9 +56,10 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   quand même. Les webhooks refusés (400, 401) et les images inconnues de Coolify sont des
   échecs ; refus de webhook limité à un message par raison toutes les 10 min.
 - Coolify injoignable (tunnel coupé, 530) : une seule notification, mise en pause, sonde
-  toutes les `COOLIFY_PROBE_SECONDS`, une notification au retour avec la liste des mises à
-  jour manquées (en mémoire, pas de rejeu automatique). Ne pas remettre une notification
-  par alerte Diun.
+  toutes les `COOLIFY_PROBE_SECONDS`. Au retour, avec `AUTO_DEPLOY`, rejeu un service à la
+  fois (`COOLIFY_REPLAY_DELAY_SECONDS` entre deux, seul un `update` du tag en service) et UN
+  seul compte rendu final ; sinon une notification qui liste les mises à jour manquées. File
+  en mémoire. Ne pas remettre une notification par alerte Diun.
 - Image de base : reconstruction une à une, arrêt au premier échec, autre majeure = annonce. Ne jamais afficher `WEBHOOK_SECRET` ni le jeton Coolify (ni dans les journaux).
 
 ## Reprise de session

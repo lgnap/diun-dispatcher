@@ -70,6 +70,7 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
 | `NOTIFY_LEVEL`        | `all`   | `all` sends every notification; `failures` keeps only what went wrong (failed or stalled redeploy, failed rebuild or series upgrade, rejected webhook, image unknown to Coolify) and drops successes and announcements. See [Notification format](#notification-format) |
 | `COOLIFY_PROBE_SECONDS` | `120` | While Coolify is unreachable, how often the dispatcher retries it. See [When Coolify is unreachable](#when-coolify-is-unreachable) |
+| `COOLIFY_REPLAY_DELAY_SECONDS` | `20` | After a Coolify outage with `AUTO_DEPLOY`, pause between two services redeployed one after the other. See [When Coolify is unreachable](#when-coolify-is-unreachable) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
 | `SERIES_CHECK_HOUR`   | `5`     | Hour of the day (0-23, container time zone) of the daily virtual series check |
 | `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file |
@@ -466,8 +467,14 @@ send one notification per Diun alert:
    any Coolify call or notification. The image is only remembered, in memory (lost if the
    dispatcher restarts). The daily series check is skipped.
 3. Every `COOLIFY_PROBE_SECONDS` (default 120) the dispatcher retries Coolify.
-4. When it answers, one `✅ Coolify is back` notification lists the updates reported meanwhile.
-   Nothing is deployed by itself: redeploy what the list names.
+4. When it answers, the updates reported meanwhile are handled as the webhook would have:
+   - with `AUTO_DEPLOY`, an `update` of the tag in service is redeployed, one service at a time
+     (a service with several missed images restarts once), `COOLIFY_REPLAY_DELAY_SECONDS`
+     apart. A `new` tag, an image unknown to Coolify and an update of another tag are not
+     deployed. One single report at the end lists every outcome
+     (`✅ Coolify is back — 3 redeployed`, or `❌ … 1 of 3 redeploys failed` with the reason);
+     the usual per-service notifications are replaced by it;
+   - without `AUTO_DEPLOY`, one `✅ Coolify is back` notification lists the missed updates.
 
 ### Only be notified of failures
 

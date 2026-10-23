@@ -2667,7 +2667,8 @@ def test_coolify_back_notifies_once_and_lists_what_was_missed(mock_notify):
     with patch('main.spawn') as spawn:
         spawn.side_effect = lambda coro: coro.close()
         _list_services(_failing_coolify_client())
-    main._coolify_missed["docker.io/library/nextcloud:34-apache"] = "nextcloud"
+    main._coolify_missed["docker.io/library/nextcloud:34-apache"] = {
+        "container": "nextcloud", "status": "update", "hostname": "diun-host"}
     mock_notify.reset_mock()
 
     assert _list_services(_working_coolify_client([MATCHING_SERVICE])) == [MATCHING_SERVICE]
@@ -2708,7 +2709,8 @@ def test_webhook_while_coolify_is_down_is_queued_without_calling_coolify_or_noti
     assert resp.json()["action"] == "coolify-down"
     mock_coolify.assert_not_awaited()
     mock_notify.assert_not_called()
-    assert main._coolify_missed == {"docker.io/library/nextcloud:34-apache": "nextcloud"}
+    assert main._coolify_missed == {"docker.io/library/nextcloud:34-apache": {
+        "container": "nextcloud", "status": "update", "hostname": "diun-host"}}
     _reset_coolify_state()
 
 
@@ -2725,7 +2727,7 @@ def test_webhook_whose_listing_fails_is_queued_not_announced_as_unknown(mock_not
     mock_notify.assert_called_once()
     assert "Coolify unreachable" in mock_notify.call_args.args[1]
     assert "no deploy available" not in mock_notify.call_args.args[1]
-    assert "nextcloud" in main._coolify_missed.values()
+    assert [e["container"] for e in main._coolify_missed.values()] == ["nextcloud"]
     _reset_coolify_state()
 
 
@@ -2776,3 +2778,157 @@ def test_series_check_is_skipped_while_coolify_is_down(mock_coolify):
         asyncio.run(main.run_series_check())
     mock_coolify.assert_not_awaited()
     _reset_coolify_state()
+
+
+# ============================================================================
+# Coolify back: replay the missed updates one by one, one report at the end
+# ============================================================================
+
+def _missed(*events):
+    return {image: {"container": name, "status": status, "hostname": "diun-host"}
+            for image, name, status in events}
+
+
+SECOND_SERVICE = {
+    "uuid": "svc-2", "status": "running:healthy", "server": {"name": "server3"},
+    "applications": [{"name": "gitea", "image": "gitea/gitea:1.27"}], "databases": [],
+}
+
+
+def _replay(missed, services, outcomes_by_uuid=None, env=None):
+    """Run replay_missed with a fake _redeploy that records the order of the calls."""
+    import asyncio
+    import main
+    calls, sleeps = [], []
+    outcomes_by_uuid = outcomes_by_uuid or {}
+
+    async def fake_redeploy(url, token, uuid, pending, outcomes=None):
+        calls.append((uuid, list(pending["containers"]), list(pending["images"])))
+        ok, detail = outcomes_by_uuid.get(uuid, (True, "running:healthy"))
+        outcomes.append((", ".join(pending["containers"]), ", ".join(pending["images"]), ok, detail))
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+
+    async def release(uuid, lock):
+        lock.release()
+
+    main._service_restart_locks.clear()
+    env = {"COOLIFY_API_URL": "http://coolify", "COOLIFY_TOKEN": "t", "AUTO_DEPLOY": "true",
+           "COOLIFY_REPLAY_DELAY_SECONDS": "15", **(env or {})}
+    with patch.dict(os.environ, env, clear=True), \
+         patch('main._redeploy', new=fake_redeploy), \
+         patch('main._release_after_hold', new=release), \
+         patch('main.spawn', new=lambda coro: asyncio.get_event_loop().create_task(coro)), \
+         patch('main.asyncio.sleep', new=sleep), \
+         patch('main.send_notification') as notify:
+        async def run():
+            await main.replay_missed(services, missed)
+        asyncio.run(run())
+    return calls, sleeps, notify
+
+
+def test_replay_redeploys_services_one_by_one_with_a_delay_and_reports_once():
+    missed = _missed(("docker.io/library/nextcloud:34-apache", "nextcloud", "update"),
+                     ("docker.io/gitea/gitea:1.27", "gitea", "update"))
+    calls, sleeps, notify = _replay(missed, [MATCHING_SERVICE, SECOND_SERVICE])
+
+    assert [c[0] for c in calls] == ["svc-1", "svc-2"]
+    assert sleeps == [15.0], "a delay between two services, none before the first"
+    notify.assert_called_once()
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "✅" in title and "2 redeployed" in title
+    assert "nextcloud" in body and "gitea" in body
+    assert not notify.call_args.kwargs.get("info")
+
+
+def test_replay_restarts_a_service_once_for_all_its_missed_images():
+    service = {**MATCHING_SERVICE, "applications": [
+        {"name": "nextcloud", "image": "nextcloud:34-apache"},
+        {"name": "redis", "image": "redis:7"}]}
+    missed = _missed(("docker.io/library/nextcloud:34-apache", "nextcloud", "update"),
+                     ("docker.io/library/redis:7", "redis", "update"))
+    calls, _, notify = _replay(missed, [service])
+    assert len(calls) == 1
+    assert calls[0][1] == ["nextcloud", "redis"]
+    assert "1 redeployed" in notify.call_args.args[1]
+
+
+def test_replay_reports_a_failure_in_the_same_single_message():
+    missed = _missed(("docker.io/library/nextcloud:34-apache", "nextcloud", "update"),
+                     ("docker.io/gitea/gitea:1.27", "gitea", "update"))
+    calls, _, notify = _replay(missed, [MATCHING_SERVICE, SECOND_SERVICE],
+                               {"svc-1": (False, "never came back (last status: exited)")})
+    assert len(calls) == 2, "a failure does not stop the others"
+    notify.assert_called_once()
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "❌" in title and "1 of 2" in title
+    assert "never came back" in body
+    assert not notify.call_args.kwargs.get("info")
+
+
+def test_replay_does_not_redeploy_a_new_tag_or_an_unknown_image():
+    missed = _missed(("docker.io/library/nextcloud:35-apache", "nextcloud", "new"),
+                     ("docker.io/library/unknown:1", "unknown", "update"))
+    calls, _, notify = _replay(missed, [MATCHING_SERVICE])
+    assert calls == []
+    notify.assert_called_once()
+    body = notify.call_args.args[2]
+    assert "nextcloud" in body and "unknown" in body
+
+
+def test_replay_skips_an_update_of_another_tag_than_the_one_in_service():
+    missed = _missed(("docker.io/library/nextcloud:33-apache", "nextcloud", "update"))
+    calls, _, _ = _replay(missed, [MATCHING_SERVICE])
+    assert calls == []
+
+
+@patch('main.send_notification')
+def test_coolify_back_with_auto_deploy_replays_instead_of_listing(mock_notify):
+    import main
+    _reset_coolify_state()
+    with patch('main.spawn') as spawn:
+        spawn.side_effect = lambda coro: coro.close()
+        _list_services(_failing_coolify_client())
+        main._coolify_missed.update(_missed(("docker.io/library/nextcloud:34-apache", "nextcloud", "update")))
+        mock_notify.reset_mock()
+        spawn.reset_mock()
+        with patch.dict(os.environ, {"AUTO_DEPLOY": "true"}):
+            _list_services(_working_coolify_client([MATCHING_SERVICE]))
+    mock_notify.assert_not_called()  # the replay sends the one report itself
+    spawn.assert_called_once()
+    assert not main.coolify_is_down() and main._coolify_missed == {}
+
+
+def test_redeploy_collects_its_outcome_instead_of_notifying():
+    import asyncio
+    import main
+    pending = {"containers": ["nextcloud"], "images": ["nextcloud:34"], "baseline": "running:healthy",
+               "server": "srv", "deploy_link": ""}
+    outcomes = []
+    with patch('main.get_service_status', new=AsyncMock(return_value="running:healthy")), \
+         patch('main.trigger_coolify', new=AsyncMock(return_value={"ok": False})), \
+         patch('main.send_notification') as notify:
+        asyncio.run(main._redeploy("http://c", "t", "svc-1", pending, outcomes=outcomes))
+    notify.assert_not_called()
+    assert outcomes == [("nextcloud", "nextcloud:34", False, "auto-deploy could not be triggered")]
+
+
+def test_watch_collects_success_and_failure_instead_of_notifying():
+    outcomes = []
+    with patch('main.send_notification') as notify:
+        _watch(["restarting:unhealthy", "running:healthy"], outcomes=outcomes)
+        _watch(["exited"], outcomes=outcomes, timeout=60)
+    notify.assert_not_called()
+    assert [o[2] for o in outcomes] == [True, False]
+    assert "never came back" in outcomes[1][3]
+
+
+def test_replay_delay_defaults_and_accepts_zero():
+    import main
+    with patch.dict(os.environ, {}, clear=True):
+        assert main.coolify_replay_delay_seconds() == 20
+    with patch.dict(os.environ, {"COOLIFY_REPLAY_DELAY_SECONDS": "0"}, clear=True):
+        assert main.coolify_replay_delay_seconds() == 0
+    with patch.dict(os.environ, {"COOLIFY_REPLAY_DELAY_SECONDS": "abc"}, clear=True):
+        assert main.coolify_replay_delay_seconds() == 20
