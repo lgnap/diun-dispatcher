@@ -69,6 +69,7 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | `DISPATCHER_URL`      | (none)  | Your dispatcher URL for manual deploy links in notifications (e.g., `https://dispatcher.example.com`) |
 | `APPRISE_URLS`        | (none)  | Comma-separated Apprise notification URLs (see examples below) |
 | `NOTIFY_LEVEL`        | `all`   | `all` sends every notification; `failures` keeps only what went wrong (failed or stalled redeploy, failed rebuild or series upgrade, rejected webhook, image unknown to Coolify) and drops successes and announcements. See [Notification format](#notification-format) |
+| `COOLIFY_PROBE_SECONDS` | `120` | While Coolify is unreachable, how often the dispatcher retries it. See [When Coolify is unreachable](#when-coolify-is-unreachable) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
 | `SERIES_CHECK_HOUR`   | `5`     | Hour of the day (0-23, container time zone) of the daily virtual series check |
 | `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file |
@@ -455,13 +456,26 @@ Example:
 🚀 Deploy [a1b2c3d4]: https://dispatcher.example.com/deploy?uuid=...
 ```
 
+### When Coolify is unreachable
+
+If the Coolify API cannot be reached (tunnel cut, instance down), the dispatcher does not
+send one notification per Diun alert:
+
+1. The first failed call sends one `❌ Coolify unreachable — deployments paused` notification.
+2. While Coolify is down, Diun alerts are answered `200` with `action: coolify-down`, without
+   any Coolify call or notification. The image is only remembered, in memory (lost if the
+   dispatcher restarts). The daily series check is skipped.
+3. Every `COOLIFY_PROBE_SECONDS` (default 120) the dispatcher retries Coolify.
+4. When it answers, one `✅ Coolify is back` notification lists the updates reported meanwhile.
+   Nothing is deployed by itself: redeploy what the list names.
+
 ### Only be notified of failures
 
 `NOTIFY_LEVEL=failures` keeps the notifications that report a problem and drops the rest:
 
 | Kept (failures) | Dropped |
 |-----------------|---------|
-| auto-deploy could not be triggered; service never came back; rebuild interrupted or stopped on a failure; series upgrade failed or compose unreadable; webhook refused (invalid secret, invalid JSON, throttled to one per 10 min and reason); image Diun reports that no Coolify resource runs | ✅ redeploy done, ✅ rebuild done, ✅ series upgrade applied; new image / new version / deploy link; series proposals; base image announcements |
+| auto-deploy could not be triggered; service never came back; rebuild interrupted or stopped on a failure; series upgrade failed or compose unreadable; Coolify unreachable and back; webhook refused (invalid secret, invalid JSON, throttled to one per 10 min and reason); image Diun reports that no Coolify resource runs | ✅ redeploy done, ✅ rebuild done, ✅ series upgrade applied; new image / new version / deploy link; series proposals; base image announcements |
 
 Dropped notifications still appear in the logs (`NOTIFY_LEVEL=failures, not sending: …`).
 The default is `all`; an unknown value falls back to `all` with a warning. Since a quiet
