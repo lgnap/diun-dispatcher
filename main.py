@@ -337,14 +337,16 @@ async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
         hostname = event.get("hostname", "unknown")
         server = (matched.get("server") or {}).get("name") or hostname.split(".")[0]
         group = groups.setdefault(uuid, {
-            "containers": [], "images": [], "baseline": matched.get("status", ""),
+            "containers": [], "images": [], "items": [], "uuid": uuid,
+            "baseline": matched.get("status", ""),
             "server": server, "deploy_link": build_deploy_link(uuid)})
         group["containers"].append(name)
         group["images"].append(image)
+        group["items"].append((name, image))
 
     queue = list(groups.items())
     rows = await run_redeploys(coolify_url, token, lambda: queue.pop(0) if queue else None)
-    send_redeploy_report(rows, notes, heading="Coolify is back — ", always=True, ok_is_info=False)
+    await send_redeploy_report(rows, notes, heading="Coolify is back — ", always=True, ok_is_info=False)
 
 
 def coolify_down_response(container_name: str, image: str, status: str = "update",
@@ -747,6 +749,7 @@ async def startup_event():
     """Initialize cache and log configuration on application startup"""
     global _series_task
     _load_cache_from_disk()
+    _load_image_versions()
     log_environment_config()
     _series_task = asyncio.create_task(series_check_loop())
 
@@ -969,6 +972,36 @@ def deploy_debounce_seconds() -> float:
     return value if value >= 0 else DEPLOY_DEBOUNCE_DEFAULT_SECONDS
 
 
+# The last version deployed of each image, to show "old ⇒ new" in the report.
+# Remembered in a file next to the UUID cache so that it survives a restart.
+VERSIONS_FILE = CACHE_FILE.with_name("image_versions.json")
+_image_versions: dict[str, str] = {}
+
+
+def _load_image_versions() -> None:
+    global _image_versions
+    try:
+        _image_versions = json.loads(VERSIONS_FILE.read_text())
+    except FileNotFoundError:
+        _image_versions = {}
+    except Exception as e:
+        logger.warning(f"Could not read {VERSIONS_FILE}: {e}")
+        _image_versions = {}
+
+
+def _save_image_versions() -> None:
+    try:
+        VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        VERSIONS_FILE.write_text(json.dumps(_image_versions, separators=(",", ":")))
+    except Exception as e:
+        logger.warning(f"Could not save {VERSIONS_FILE}: {e}")
+
+
+async def current_image_version(image: str) -> str | None:
+    """The version label of the image now published under its tag, None if unreadable."""
+    return await fetch_image_version(image)
+
+
 async def run_redeploys(coolify_url: str, coolify_token: str, next_group) -> list[tuple[dict, tuple]]:
     """Redeploy services one at a time, `deploy_pause_seconds` apart, and collect the
     outcomes instead of notifying. `next_group()` returns the next (uuid, pending) or
@@ -997,10 +1030,11 @@ async def run_redeploys(coolify_url: str, coolify_token: str, next_group) -> lis
     return rows
 
 
-def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str], heading: str,
-                         always: bool, ok_is_info: bool) -> None:
-    """The one message that closes a batch of redeploys. `ok_is_info`: an all-good report
-    is an announcement that NOTIFY_LEVEL=failures drops."""
+async def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str], heading: str,
+                               always: bool, ok_is_info: bool) -> None:
+    """The one message that closes a batch of redeploys, per machine then per container:
+    `- php: 8.4.1 ⇒ 8.4.2 ✅`. `ok_is_info`: an all-good report is an announcement that
+    NOTIFY_LEVEL=failures drops."""
     if not rows and not notes and not always:
         return
     failed = [r for r in rows if not r[1][2]]
@@ -1010,14 +1044,34 @@ def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str], headi
         title = f"✅ {heading}{len(rows)} redeployed"
     else:
         title = f"✅ {heading}nothing to redeploy"
-    lines = []
+
+    by_server: dict[str, list[str]] = {}
+    remembered = False
     for pending, (name, image, ok, detail) in rows:
-        line = f"• {name} ({image}) on {pending['server']}: {'✅' if ok else '❌'} {detail}".rstrip()
-        if not ok and pending.get("deploy_link"):
-            line += pending["deploy_link"]
-        lines.append(line)
-    send_notification(load_apprise_urls(), title,
-                      "\n".join(lines + notes) or "No update was reported meanwhile.",
+        uuid = pending.get("uuid", "")
+        items = pending.get("items") or [(name, image)]
+        for position, (container, container_image) in enumerate(items):
+            display = container.removesuffix(f"-{uuid}") if uuid else container
+            key = normalize_image(container_image)
+            new = (await current_image_version(container_image)) or image_tag(container_image)
+            old = _image_versions.get(key, "?")
+            line = f" - {display}: {old} ⇒ {new} {'✅' if ok else '❌'}"
+            if not ok:
+                line += f" {detail}".rstrip()
+                if position == len(items) - 1:  # one manual link per service
+                    line += pending.get("deploy_link", "")
+            by_server.setdefault(pending.get("server", "unknown"), []).append(line)
+            if ok:
+                _image_versions[key] = new
+                remembered = True
+    if remembered:
+        _save_image_versions()
+
+    lines = [f"**{server}**\n" + "\n".join(items) for server, items in by_server.items()]
+    body = "\n".join(lines)
+    if notes:
+        body += ("\n\n" if body else "") + "Not redeployed:\n" + "\n".join(notes)
+    send_notification(load_apprise_urls(), title, body or "No update was reported meanwhile.",
                       info=ok_is_info and not failed)
 
 
@@ -1040,7 +1094,7 @@ async def _run_batch(coolify_url: str, coolify_token: str) -> None:
             return uuid, _pending_redeploys[uuid]
 
         rows = await run_redeploys(coolify_url, coolify_token, next_group)
-        send_redeploy_report(rows, [], heading="", always=False, ok_is_info=True)
+        await send_redeploy_report(rows, [], heading="", always=False, ok_is_info=True)
     finally:
         for uuid in _batch_queue:
             _pending_redeploys.pop(uuid, None)
@@ -1065,12 +1119,16 @@ def schedule_service_redeploy(coolify_url: str, coolify_token: str, uuid: str,
             pending["containers"].append(container_name)
         if image not in pending["images"]:
             pending["images"].append(image)
+        if (container_name, image) not in pending["items"]:
+            pending["items"].append((container_name, image))
         logger.info(f"Update of {image} merged into the pending restart of service {uuid}")
         return "auto-deploy-merged"
 
     pending = {
         "containers": [container_name],
         "images": [image],
+        "items": [(container_name, image)],
+        "uuid": uuid,
         "baseline": baseline_status,
         "server": server,
         "deploy_link": deploy_link,

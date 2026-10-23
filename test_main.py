@@ -4,7 +4,20 @@ import time
 import httpx
 from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
-from main import app, get_cloudflare_headers
+from main import app, get_cloudflare_headers, current_image_version as _real_current_image_version
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolated_image_versions(tmp_path):
+    """The report reads the registry and remembers versions in a file: neither may
+    touch the network or the disk of the test machine."""
+    import main
+    main._image_versions.clear()
+    with patch.object(main, "VERSIONS_FILE", tmp_path / "image_versions.json"), \
+         patch.object(main, "current_image_version", new=AsyncMock(return_value=None)):
+        yield
+    main._image_versions.clear()
 
 
 def test_get_cloudflare_headers_with_both_credentials():
@@ -2225,8 +2238,8 @@ def test_merged_redeploy_that_cannot_be_triggered_is_notified_once(mock_coolify,
     mock_notify.assert_called_once()
     title, body = mock_notify.call_args.args[1], mock_notify.call_args.args[2]
     assert "❌" in title and "1 of 1" in title
-    assert "nginx-svc-2" in body and "php-svc-2" in body
-    assert "could not be triggered" in body
+    assert " - nginx: " in body and " - php: " in body
+    assert body.count("could not be triggered") == 2 and body.count("/deploy?uuid=") == 1
     assert "/deploy?uuid=" in body
 
 
@@ -2996,8 +3009,8 @@ def test_a_burst_sends_one_report_not_one_notification_per_service():
     notify.assert_called_once()
     title, body = notify.call_args.args[1], notify.call_args.args[2]
     assert "✅" in title and "2 redeployed" in title
-    assert "nextcloud" in body and "nginx-svc-2" in body
-    assert "server2-prod" in body and "server1" in body
+    assert "nextcloud" in body and "nginx" in body
+    assert "**server2-prod**" in body and "**server1**" in body
     assert notify.call_args.kwargs.get("info") is True, "NOTIFY_LEVEL=failures drops an all-good report"
 
 
@@ -3024,3 +3037,114 @@ def test_the_batch_window_can_be_set():
     _, _, sleeps, _ = _burst([DIUN_PAYLOAD], [MATCHING_SERVICE], env={"DEPLOY_DEBOUNCE_SECONDS": "5"})
     assert sleeps == [5.0]
 
+
+
+# ============================================================================
+# Report layout: per machine, per container, old version => new version, status
+# ============================================================================
+
+def _report(rows, notes=(), versions=None, published=None):
+    """Build the report body for (pending, outcome) rows; returns (title, body, info)."""
+    import asyncio
+    import main
+    main._image_versions.clear()
+    main._image_versions.update(versions or {})
+    published = published or {}
+
+    async def current(image):
+        return published.get(image)
+
+    with patch('main.current_image_version', new=current), \
+         patch('main.send_notification') as notify:
+        asyncio.run(main.send_redeploy_report(rows, list(notes), heading="", always=False,
+                                              ok_is_info=True))
+    return notify.call_args.args[1], notify.call_args.args[2], notify.call_args.kwargs.get("info")
+
+
+def _row(name, image, server="srv1", uuid="svc-9", ok=True, detail="", link="", items=None):
+    pending = {"containers": [name], "images": [image], "server": server, "uuid": uuid,
+               "deploy_link": link, "items": items or [(name, image)]}
+    return pending, (name, image, ok, detail)
+
+
+NEXTCLOUD = "docker.io/library/nextcloud:34-apache"
+
+
+def test_report_groups_containers_under_their_machine_with_old_and_new_version():
+    import main
+    rows = [_row("nextcloud-svc-9", NEXTCLOUD, server="music-assistant"),
+            _row("redis-svc-9", "docker.io/library/redis:7", server="music-assistant"),
+            _row("gitea-svc-8", "docker.io/gitea/gitea:1.27", server="boum", uuid="svc-8")]
+    versions = {main.normalize_image(NEXTCLOUD): "34.0.0"}
+    published = {NEXTCLOUD: "34.0.1", "docker.io/gitea/gitea:1.27": "1.27.4"}
+    title, body, info = _report(rows, versions=versions, published=published)
+
+    assert body.split("\n") == [
+        "**music-assistant**",
+        " - nextcloud: 34.0.0 ⇒ 34.0.1 ✅",
+        " - redis: ? ⇒ 7 ✅",
+        "**boum**",
+        " - gitea: ? ⇒ 1.27.4 ✅",
+    ]
+    assert title == "✅ 3 redeployed" and info is True
+
+
+def test_report_strips_the_service_uuid_from_the_container_name():
+    _, body, _ = _report([_row("php-svc-9", NEXTCLOUD, uuid="svc-9")])
+    assert " - php: " in body and "svc-9" not in body
+
+
+def test_report_falls_back_to_the_tag_when_the_image_has_no_version_label():
+    _, body, _ = _report([_row("nextcloud", NEXTCLOUD)], published={NEXTCLOUD: None})
+    assert " - nextcloud: ? ⇒ 34-apache ✅" in body
+
+
+def test_report_shows_the_reason_and_the_manual_link_of_a_failure():
+    rows = [_row("diun", "docker.io/crazymax/diun:4", ok=False,
+                 detail="never came back (last status: exited)", link="\n🚀 http://x/deploy?uuid=svc-9")]
+    import main
+    title, body, info = _report(rows, versions={main.normalize_image("docker.io/crazymax/diun:4"): "4.28.0"},
+                                published={"docker.io/crazymax/diun:4": "4.29.0"})
+    assert " - diun: 4.28.0 ⇒ 4.29.0 ❌ never came back (last status: exited)" in body
+    assert "/deploy?uuid=svc-9" in body
+    assert "❌" in title and not info
+
+
+def test_report_lists_what_was_not_redeployed_after_the_machines():
+    _, body, _ = _report([_row("nextcloud", NEXTCLOUD)], notes=["• gitea: new version 1.28 reported, nothing applied"])
+    assert body.index("**srv1**") < body.index("Not redeployed") < body.index("• gitea")
+
+
+def test_report_remembers_the_deployed_version_but_not_after_a_failure():
+    import main
+    ok_rows = [_row("nextcloud", NEXTCLOUD)]
+    _report(ok_rows, published={NEXTCLOUD: "34.0.1"})
+    assert main._image_versions[main.normalize_image(NEXTCLOUD)] == "34.0.1"
+    assert json.loads(main.VERSIONS_FILE.read_text()) == {main.normalize_image(NEXTCLOUD): "34.0.1"}
+
+    _report([_row("nextcloud", NEXTCLOUD, ok=False, detail="boom")],
+            versions={main.normalize_image(NEXTCLOUD): "34.0.1"}, published={NEXTCLOUD: "34.0.2"})
+    assert main._image_versions[main.normalize_image(NEXTCLOUD)] == "34.0.1"
+
+
+def test_remembered_versions_survive_a_restart():
+    import main
+    main.VERSIONS_FILE.write_text(json.dumps({"docker.io/library/nextcloud:34-apache": "34.0.1"}))
+    main._image_versions.clear()
+    main._load_image_versions()
+    assert main._image_versions == {"docker.io/library/nextcloud:34-apache": "34.0.1"}
+
+
+def test_unreadable_versions_file_is_ignored():
+    import main
+    main.VERSIONS_FILE.write_text("not json")
+    main._load_image_versions()
+    assert main._image_versions == {}
+
+
+
+def test_current_image_version_reads_the_registry_label():
+    import asyncio
+    with patch('main.fetch_image_version', new=AsyncMock(return_value="4.2.1")) as fetch:
+        assert asyncio.run(_real_current_image_version("ghcr.io/yeraze/meshmonitor:4")) == "4.2.1"
+    fetch.assert_awaited_once_with("ghcr.io/yeraze/meshmonitor:4")

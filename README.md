@@ -231,9 +231,25 @@ Several Diun instances usually report within seconds of each other. The first au
 redeploy opens a window of `DEPLOY_DEBOUNCE_SECONDS` (default 60); every update arriving
 meanwhile joins it. The services are then redeployed **one at a time**, each followed by
 the wait until it is back, `DEPLOY_PAUSE_SECONDS` (default 20) apart, and **one report**
-closes the batch, with one line per service (container, image, server, outcome). A failure
-does not stop the next services. With `NOTIFY_LEVEL=failures`, the report is only sent if
-something failed.
+closes the batch, grouped by machine then by container (the Coolify service id is removed
+from the name), with the version that was running and the one now deployed:
+
+```
+✅ 3 redeployed
+
+**music-assistant**
+ - meshmonitor: 4.2.0 ⇒ 4.2.1 ✅
+ - redis: 7.4.1 ⇒ 7.4.2 ✅
+**boum**
+ - diun: 4.28.0 ⇒ 4.29.0 ❌ never came back (last status: exited)
+```
+
+A failed line carries the reason and the manual deploy link. Versions come from the
+`org.opencontainers.image.version` label of the image published under its tag, or the tag
+itself when the image has no such label. The previous version is the last one the
+dispatcher deployed, remembered in `image_versions.json` next to `CACHE_FILE` (`?` the
+first time). A failure does not stop the next services. With `NOTIFY_LEVEL=failures`, the
+report is only sent if something failed.
 
 ### One restart at a time per service
 
