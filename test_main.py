@@ -3242,3 +3242,26 @@ def test_each_tag_of_a_repository_remembers_its_own_version():
         "docker.io/gitea/gitea:1.26": "1.26.4", "docker.io/gitea/gitea:1.27": "1.27.2"})
     assert " - gitea-old: 1.26.3 ⇒ 1.26.4 ✅" in body
     assert " - gitea-new: 1.27.1 ⇒ 1.27.2 ✅" in body
+
+
+# A registry may offer Basic next to Bearer (Gitea does): httpx joins the two
+# WWW-Authenticate headers, and the Basic realm ("Gitea Container Registry") is
+# not a URL. Only the Bearer challenge is used.
+@pytest.mark.parametrize("challenge", [
+    'Bearer realm="https://reg.test/v2/token",service="container_registry",scope="*", '
+    'Basic realm="Gitea Container Registry"',
+    'Basic realm="Gitea Container Registry", '
+    'Bearer realm="https://reg.test/v2/token",service="container_registry",scope="*"',
+])
+@patch("main.httpx.AsyncClient")
+def test_registry_token_ignores_a_basic_challenge(mock_client_cls, challenge):
+    import asyncio
+    import main
+    client_ = MagicMock()
+    client_.get = AsyncMock(return_value=_registry_response(200, {"token": "anon"}))
+
+    token = asyncio.run(main._registry_token(client_, challenge))
+
+    assert token == "anon"
+    assert client_.get.call_args.args[0] == "https://reg.test/v2/token"
+    assert client_.get.call_args.kwargs["params"] == {"service": "container_registry", "scope": "*"}

@@ -1417,7 +1417,9 @@ def registry_repository(image: str) -> tuple[str, str]:
 
 async def _registry_token(client: httpx.AsyncClient, challenge: str) -> str | None:
     """Get an anonymous pull token from the realm a registry's 401 points to."""
-    params = dict(re.findall(r'(\w+)="([^"]*)"', challenge))
+    # Several challenges may be joined ("Bearer ..., Basic realm=..."): keep the Bearer one
+    bearer = re.search(r'Bearer\s+(.*?)(?=,\s*(?:Basic|Digest|Negotiate)\s|$)', challenge, re.I)
+    params = dict(re.findall(r'(\w+)="([^"]*)"', bearer.group(1) if bearer else challenge))
     realm = params.pop("realm", None)
     if not realm:
         return None
