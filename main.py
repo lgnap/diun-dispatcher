@@ -1699,7 +1699,11 @@ async def handle_base_image_event(image: str, status: str, digest: str | None,
     series = str(metadata.get(BASE_SERIES_KEY) or "").strip()
     version = await fetch_image_version(image, digest)
     apprise_urls = load_apprise_urls()
-    listed = "\n".join(f"• {uuid}" for uuid in uuids)
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+    names = await get_application_names(coolify_url, coolify_token) \
+        if coolify_url and coolify_token else {}
+    listed = "\n".join(f"• {names.get(uuid, uuid)}" for uuid in uuids)
 
     if not base_series_matches(version, series):
         logger.warning(f"Base {image} is at {version!r}, outside series {series!r}: announce only")
@@ -1723,8 +1727,6 @@ async def handle_base_image_event(image: str, status: str, digest: str | None,
         )
         return JSONResponse({"ok": True, "action": "base-notified", "version": version})
 
-    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
-    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
     if not coolify_url or not coolify_token:
         logger.warning("COOLIFY_API_URL or COOLIFY_TOKEN not configured, base rebuild skipped")
         return JSONResponse({"ok": True, "action": "base-no-coolify"})

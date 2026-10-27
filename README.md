@@ -375,7 +375,7 @@ On an `update` of that image, the dispatcher:
    the registry;
 2. if its major differs from `rebuild_series` (or cannot be read), **announces
    only**: a base that moved to a new major is a planned upgrade, never an
-   automatic one;
+   automatic one (the notification lists the applications by their Coolify name);
 3. otherwise, with `AUTO_DEPLOY` on, deploys the applications **one at a time,
    in the listed order** (`POST /api/v1/deploy`), follows each deployment, and
    stops at the first one that does not finish: list staging before prod;
