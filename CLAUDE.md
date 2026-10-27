@@ -14,7 +14,7 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (274 tests, environ 2 s).
+- Tests : `.venv/bin/python -m pytest -q` (279 tests, environ 2 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
@@ -55,7 +55,7 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   `❌ K sur N`, info si tout va bien). Ne plus notifier service par service ; la même
   mécanique (`run_redeploys`, `send_redeploy_report`) sert au rejeu après panne de Coolify.
   Le compte rendu est groupé par machine puis conteneur (`- php: ancienne ⇒ nouvelle ✅`), les
-  versions viennent du label OCI de l'image et sont mémorisées dans `image_versions.json`
+  versions viennent du label OCI de l'image (sans label : le tag suivi des 7 premiers caractères du digest Diun, `latest (3f2a9c1)`) et sont mémorisées dans `image_versions.json`
   (à côté de `CACHE_FILE`) ; le nom de machine est en gras réel : `send_notification` prend
   `alt_bodies` (HTML/Markdown) et envoie à chaque service le corps de son propre format (pour
   Pushover, `?format=html` dans l'URL Apprise, sinon texte brut) ; en test, `current_image_version` est neutralisée (aucun réseau).

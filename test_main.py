@@ -15,6 +15,7 @@ def _isolated_image_versions(tmp_path):
     touch the network or the disk of the test machine."""
     import main
     main._image_versions.clear()
+    main._event_digests.clear()
     with patch.object(main, "VERSIONS_FILE", tmp_path / "image_versions.json"), \
          patch.object(main, "current_image_version", new=AsyncMock(return_value=None)):
         yield
@@ -3265,3 +3266,42 @@ def test_registry_token_ignores_a_basic_challenge(mock_client_cls, challenge):
     assert token == "anon"
     assert client_.get.call_args.args[0] == "https://reg.test/v2/token"
     assert client_.get.call_args.kwargs["params"] == {"service": "container_registry", "scope": "*"}
+
+
+# --- no version label: the tag alone ("latest ⇒ latest") hides a change; the digest shows it
+
+def test_short_digest_is_seven_hex_characters():
+    import main
+    assert main.short_digest("sha256:0123456789abcdef") == "0123456"
+    assert main.short_digest("") is None and main.short_digest(None) is None
+
+
+def test_report_shows_the_digest_when_the_image_has_no_version_label():
+    import main
+    image = "git.example.test/team/app:latest"
+    main._event_digests[main.image_version_key(image)] = "sha256:bbbbbbb1111"
+    versions = {main.image_version_key(image): "latest (aaaaaaa)"}
+    _, body, _ = _report([_row("app-svc-9", image)], versions=versions)
+    assert "- app: latest (aaaaaaa) ⇒ latest (bbbbbbb) ✅" in body
+
+
+def test_report_prefers_the_version_label_over_the_digest():
+    import main
+    image = "git.example.test/team/app:latest"
+    main._event_digests[main.image_version_key(image)] = "sha256:bbbbbbb1111"
+    _, body, _ = _report([_row("app-svc-9", image)], published={image: "2.0.0"})
+    assert "⇒ 2.0.0 ✅" in body
+
+
+def test_report_without_label_or_digest_falls_back_to_the_tag():
+    _, body, _ = _report([_row("app-svc-9", "git.example.test/team/app:latest")])
+    assert "? ⇒ latest ✅" in body
+
+
+def test_webhook_remembers_the_digest_of_an_update():
+    import main
+    payload = {"hostname": "h", "status": "update", "image": "git.example.test/team/app:latest",
+               "digest": "sha256:cccccccdddd", "metadata": {"ctn_names": "app-svc-9"}}
+    with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
+        client.post("/webhook", json=payload, headers={"X-Diun-Secret": "s3cret"})
+    assert main._event_digests[main.image_version_key(payload["image"])] == "sha256:cccccccdddd"
