@@ -1911,6 +1911,8 @@ def _post_base(payload, env=BASE_ENV, version="v4.5.2-1"):
         "rebuild_applications": AsyncMock(return_value=[]),
         "send_notification": MagicMock(),
         "get_coolify_applications": AsyncMock(side_effect=AssertionError("no service matching")),
+        "get_application_names": AsyncMock(return_value={"stg": "roadbook-staging",
+                                                         "prod": "roadbook-prod"}),
     }
     with patch.dict(os.environ, env, clear=True), patch.multiple("main", **mocks):
         resp = client.post("/webhook", json=payload, headers={"X-Diun-Secret": "s3cret"})
@@ -1960,6 +1962,21 @@ def test_base_in_another_major_is_only_announced():
     assert "3 application(s)" in body
 
 
+def test_base_announcement_names_the_applications():
+    resp, m = _post_base(_base_payload(), version="v5.0.0")
+
+    body = m["send_notification"].call_args.args[2]
+    assert "• roadbook-staging" in body and "• roadbook-prod" in body
+    assert "• acc" in body  # unknown to Coolify: the uuid is the fallback
+
+
+def test_base_notice_without_auto_deploy_names_the_applications():
+    env = {k: v for k, v in BASE_ENV.items() if k != "AUTO_DEPLOY"}
+    resp, m = _post_base(_base_payload(), env=env)
+
+    assert "• roadbook-staging" in m["send_notification"].call_args.args[2]
+
+
 def test_base_with_unreadable_version_is_only_announced():
     resp, m = _post_base(_base_payload(), version=None)
 
@@ -1974,7 +1991,7 @@ def test_base_without_auto_deploy_only_notifies():
 
     assert resp.json()["action"] == "base-notified"
     m["rebuild_applications"].assert_not_called()
-    assert "stg" in m["send_notification"].call_args.args[2]
+    assert "roadbook-staging" in m["send_notification"].call_args.args[2]
 
 
 def test_base_rebuild_already_running_is_dropped():
