@@ -251,7 +251,8 @@ text by default, write the URL as `pover://USER@TOKEN?format=html`.
 
 A failed line carries the reason and the manual deploy link. Versions come from the
 `org.opencontainers.image.version` label of the image published under its tag, or the tag
-itself when the image has no such label. The previous version is the last one the
+itself when the image has no such label, followed by the first 7 characters of the digest Diun
+reported (`latest (3f2a9c1)`) so that a redeploy of the same tag still shows a change. The previous version is the last one the
 dispatcher deployed, remembered in `image_versions.json` next to `CACHE_FILE` (`?` the
 first time). A failure does not stop the next services. With `NOTIFY_LEVEL=failures`, the
 report is only sent if something failed.
