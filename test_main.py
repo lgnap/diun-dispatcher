@@ -17,6 +17,7 @@ def _isolated_image_versions(tmp_path):
     main._image_versions.clear()
     main._event_digests.clear()
     with patch.object(main, "VERSIONS_FILE", tmp_path / "image_versions.json"), \
+         patch.object(main, "REBUILD_STATE_FILE", tmp_path / "rebuild_state.json"), \
          patch.object(main, "current_image_version", new=AsyncMock(return_value=None)):
         yield
     main._image_versions.clear()
@@ -3305,3 +3306,90 @@ def test_webhook_remembers_the_digest_of_an_update():
     with patch.dict(os.environ, {"WEBHOOK_SECRET": "s3cret"}, clear=True):
         client.post("/webhook", json=payload, headers={"X-Diun-Secret": "s3cret"})
     assert main._event_digests[main.image_version_key(payload["image"])] == "sha256:cccccccdddd"
+
+
+# --- a rebuild cut by a restart resumes where it stopped
+
+BASE_IMAGE = "docker.io/serversideup/php:8.4-fpm-nginx"
+
+
+def _run_rebuild(uuids, deploys, outcomes, resume=None):
+    import asyncio
+    import main
+    mocks = {
+        "deploy_application": AsyncMock(side_effect=deploys),
+        "wait_for_application_deployment": AsyncMock(side_effect=outcomes),
+        "get_application_names": AsyncMock(return_value={}),
+        "send_notification": MagicMock(),
+        "load_apprise_urls": MagicMock(return_value=["json://x"]),
+    }
+    with patch.multiple("main", **mocks):
+        try:
+            results = asyncio.run(main.rebuild_applications(
+                "http://coolify", "token", BASE_IMAGE, "v5.0.5-1", uuids, resume=resume))
+        except BaseException as e:
+            results = e
+    return results, mocks
+
+
+def test_rebuild_keeps_its_progress_when_the_dispatcher_is_stopped():
+    import asyncio
+    import main
+    results, m = _run_rebuild(["stg", "acc", "prod"], ["dep-stg", asyncio.CancelledError()],
+                              ["finished"])
+
+    assert isinstance(results, asyncio.CancelledError)
+    state = main.load_rebuild_state()
+    assert state["uuids"] == ["stg", "acc", "prod"] and state["version"] == "v5.0.5-1"
+    assert [r[:2] for r in state["results"]] == [["stg", "finished"]]
+    assert "resume" in m["send_notification"].call_args.args[2]
+
+
+def test_rebuild_forgets_its_progress_on_an_unexpected_error():
+    import main
+    results, m = _run_rebuild(["stg", "acc"], ["dep-stg", RuntimeError("boom")], ["finished"])
+
+    assert isinstance(results, RuntimeError)
+    assert main.load_rebuild_state() is None
+    assert "resume" not in m["send_notification"].call_args.args[2]
+
+
+@pytest.mark.parametrize("outcomes", [["finished", "finished"], ["failed"]])
+def test_rebuild_forgets_its_progress_once_finished_or_failed(outcomes):
+    import main
+    _run_rebuild(["stg", "acc"], ["dep-stg", "dep-acc"], outcomes)
+
+    assert main.load_rebuild_state() is None
+
+
+def test_resumed_rebuild_waits_for_the_deployment_in_flight_then_goes_on():
+    resume = {"image": BASE_IMAGE, "version": "v5.0.5-1", "uuids": ["stg", "acc", "prod"],
+              "results": [["stg", "finished", "dep-stg"]],
+              "current": {"uuid": "acc", "deployment_uuid": "dep-acc"}}
+    results, m = _run_rebuild(["stg", "acc", "prod"], ["dep-prod"], ["finished", "finished"],
+                              resume=resume)
+
+    assert [r[:2] for r in results] == [("stg", "finished"), ("acc", "finished"),
+                                        ("prod", "finished")]
+    assert [c.args[2] for c in m["deploy_application"].await_args_list] == ["prod"]
+    assert m["wait_for_application_deployment"].await_args_list[0].args[2] == "dep-acc"
+    assert "✅" in m["send_notification"].call_args.args[1]
+
+
+def test_startup_resumes_a_saved_rebuild():
+    import asyncio
+    import main
+    main._save_rebuild_state({"image": BASE_IMAGE, "version": "v5.0.5-1", "uuids": ["stg"],
+                              "results": [], "current": None})
+    spawned = []
+    env = {"COOLIFY_API_URL": "http://coolify", "COOLIFY_TOKEN": "token"}
+    with patch.dict(os.environ, env, clear=True), \
+         patch("main.rebuild_applications", new=MagicMock(return_value="coro")) as rebuild, \
+         patch("main.spawn", new=lambda coro: spawned.append(coro)), \
+         patch("main.series_check_loop", new=MagicMock(return_value=None)), \
+         patch("main.asyncio.create_task", new=MagicMock()):
+        asyncio.run(main.startup_event())
+
+    assert spawned == ["coro"]
+    assert rebuild.call_args.args[2:5] == (BASE_IMAGE, "v5.0.5-1", ["stg"])
+    assert rebuild.call_args.kwargs["resume"]["uuids"] == ["stg"]

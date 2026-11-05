@@ -14,7 +14,7 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (279 tests, environ 2 s).
+- Tests : `.venv/bin/python -m pytest -q` (285 tests, environ 2 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
@@ -68,7 +68,7 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   fois (`DEPLOY_PAUSE_SECONDS` entre deux, seul un `update` du tag en service) et UN
   seul compte rendu final ; sinon une notification qui liste les mises à jour manquées. File
   en mémoire. Ne pas remettre une notification par alerte Diun.
-- Image de base : reconstruction une à une, arrêt au premier échec, autre majeure = annonce. Ne jamais afficher `WEBHOOK_SECRET` ni le jeton Coolify (ni dans les journaux).
+- Image de base : reconstruction une à une, arrêt au premier échec, autre majeure = annonce. Un redémarrage du dispatcher au milieu d'une reconstruction la reprend au démarrage suivant (`rebuild_state.json` dans `/data`, volume obligatoire) : ne pas redéployer le dispatcher n'est plus nécessaire, mais le déploiement en cours se termine côté Coolify. Ne jamais afficher `WEBHOOK_SECRET` ni le jeton Coolify (ni dans les journaux).
 
 ## Reprise de session
 1. Lire `HANDOFF.md` en premier (état, en cours, prochaines étapes) ; contexte

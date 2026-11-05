@@ -770,6 +770,7 @@ async def startup_event():
     _load_cache_from_disk()
     _load_image_versions()
     log_environment_config()
+    resume_rebuild()
     _series_task = asyncio.create_task(series_check_loop())
 
 
@@ -1637,8 +1638,53 @@ async def get_application_names(coolify_url: str, coolify_token: str) -> dict[st
         return {}
 
 
+# A rebuild cut by a restart of the dispatcher resumes where it stopped: its progress
+# (applications done, deployment in flight) is kept in a file next to CACHE_FILE.
+REBUILD_STATE_FILE = CACHE_FILE.with_name("rebuild_state.json")
+
+
+def _save_rebuild_state(state: dict | None) -> None:
+    """Keep the progress of the running rebuild; None forgets it."""
+    try:
+        if state is None:
+            REBUILD_STATE_FILE.unlink(missing_ok=True)
+            return
+        REBUILD_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        REBUILD_STATE_FILE.write_text(json.dumps(state, separators=(",", ":")))
+    except Exception as e:
+        logger.warning(f"Could not save {REBUILD_STATE_FILE}: {e}")
+
+
+def load_rebuild_state() -> dict | None:
+    """The progress of a rebuild that was cut, None if there is none."""
+    try:
+        return json.loads(REBUILD_STATE_FILE.read_text())
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning(f"Could not read {REBUILD_STATE_FILE}: {e}")
+        return None
+
+
+def resume_rebuild() -> None:
+    """At startup: carry on with a rebuild the last run did not finish."""
+    state = load_rebuild_state()
+    if not state:
+        return
+    coolify_url = os.getenv("COOLIFY_API_URL", "").strip()
+    coolify_token = os.getenv("COOLIFY_TOKEN", "").strip()
+    if not coolify_url or not coolify_token:
+        logger.warning("A rebuild was cut but COOLIFY_API_URL or COOLIFY_TOKEN is not set")
+        return
+    logger.info(f"Resuming the rebuild on {state['image']} ({state['version']}) "
+                f"after {len(state['results'])} application(s)")
+    spawn(rebuild_applications(coolify_url, coolify_token, state["image"], state["version"],
+                               state["uuids"], resume=state))
+
+
 async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
-                               version: str, uuids: list[str]) -> list[tuple[str, str, str | None]]:
+                               version: str, uuids: list[str],
+                               resume: dict | None = None) -> list[tuple[str, str, str | None]]:
     """Rebuild the applications built on a base, in order, stopping at the first failure.
 
     Returns (uuid, outcome, deployment uuid) per application, [] when a run for
@@ -1650,9 +1696,24 @@ async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
         return []
     async with lock:
         names = await get_application_names(coolify_url, coolify_token)
-        results: list[tuple[str, str, str | None]] = []
+        results: list[tuple[str, str, str | None]] = (
+            [tuple(r) for r in resume["results"]] if resume else [])
+
+        def checkpoint(current: dict | None = None) -> None:
+            _save_rebuild_state({"image": image, "version": version, "uuids": uuids,
+                                 "results": results, "current": current})
+
         try:
-            for uuid in uuids:
+            if resume and resume.get("current"):
+                # The deployment in flight when the dispatcher stopped went on in Coolify
+                current = resume["current"]
+                outcome = await wait_for_application_deployment(
+                    coolify_url, coolify_token, current["deployment_uuid"])
+                logger.info(f"Rebuild of {names.get(current['uuid'], current['uuid'])} "
+                            f"on {image}: {outcome} (resumed)")
+                results.append((current["uuid"], outcome, current["deployment_uuid"]))
+                checkpoint()
+            for uuid in uuids[len(results):]:
                 if results and results[-1][1] != "finished":
                     results.append((uuid, "not deployed", None))
                     continue
@@ -1660,10 +1721,16 @@ async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
                 if not deployment_uuid:
                     results.append((uuid, "refused", None))
                     continue
+                checkpoint({"uuid": uuid, "deployment_uuid": deployment_uuid})
                 outcome = await wait_for_application_deployment(coolify_url, coolify_token, deployment_uuid)
                 logger.info(f"Rebuild of {names.get(uuid, uuid)} on {image}: {outcome}")
                 results.append((uuid, outcome, deployment_uuid))
+                checkpoint()
         except BaseException as e:
+            # Stopped by a restart (not by a bug): the next start resumes from the checkpoint
+            resumable = isinstance(e, asyncio.CancelledError)
+            if not resumable:
+                _save_rebuild_state(None)
             # Diun will not send this event again: a run that dies (dispatcher
             # restarted, unexpected error) must say where it stopped.
             done = [f"• {names.get(u, u)}: {o}" for u, o, _ in results]
@@ -1672,9 +1739,11 @@ async def rebuild_applications(coolify_url: str, coolify_token: str, image: str,
             send_notification(
                 load_apprise_urls(),
                 f"❌ Rebuild on {image_tag(image)} ({version}) interrupted",
-                f"🖼️ Base: {image}\n\n⚠️ {type(e).__name__}: {e}\n" + "\n".join(done + left),
+                f"🖼️ Base: {image}\n\n⚠️ {type(e).__name__}: {e}\n" + "\n".join(done + left)
+                + ("\n\nIt will resume when the dispatcher restarts." if resumable else ""),
             )
             raise
+        _save_rebuild_state(None)
 
     lines = []
     for uuid, outcome, deployment_uuid in results:

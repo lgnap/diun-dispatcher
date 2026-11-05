@@ -382,6 +382,11 @@ On an `update` of that image, the dispatcher:
    stops at the first one that does not finish: list staging before prod;
 4. sends one notification with the outcome of each application.
 
+If the dispatcher is restarted in the middle of a rebuild, it says so and **resumes where it
+stopped** at the next start: the deployment in flight is awaited, the remaining applications
+follow, and one report covers them all. The progress is kept in `rebuild_state.json` next to
+`CACHE_FILE`, so `/data` must be a volume.
+
 `new` events (first sighting of the entry) rebuild nothing. One run per base at
 a time.
 
