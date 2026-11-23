@@ -5,6 +5,7 @@ import httpx
 from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi.testclient import TestClient
 from main import app, get_cloudflare_headers, current_image_version as _real_current_image_version
+from main import get_coolify_databases as _real_get_coolify_databases
 import apprise
 import pytest
 
@@ -18,9 +19,11 @@ def _isolated_image_versions(tmp_path):
     main._event_digests.clear()
     with patch.object(main, "VERSIONS_FILE", tmp_path / "image_versions.json"), \
          patch.object(main, "REBUILD_STATE_FILE", tmp_path / "rebuild_state.json"), \
-         patch.object(main, "current_image_version", new=AsyncMock(return_value=None)):
+         patch.object(main, "current_image_version", new=AsyncMock(return_value=None)), \
+         patch.object(main, "get_coolify_databases", new=AsyncMock(return_value=[])):
         yield
     main._image_versions.clear()
+    main._database_uuids.clear()
 
 
 def test_get_cloudflare_headers_with_both_credentials():
@@ -3393,3 +3396,195 @@ def test_startup_resumes_a_saved_rebuild():
     assert spawned == ["coro"]
     assert rebuild.call_args.args[2:5] == (BASE_IMAGE, "v5.0.5-1", ["stg"])
     assert rebuild.call_args.kwargs["resume"]["uuids"] == ["stg"]
+
+
+# ============================================================================
+# A standalone Coolify database (issue #25): Diun names its container by the
+# uuid of the database, and no service or application runs its image.
+# ============================================================================
+
+DB_UUID = "db00000000000000000000aa"
+STANDALONE_DB = {
+    "uuid": DB_UUID, "name": "mariadb-main", "image": "mariadb:11.8-noble",
+    "status": "running:healthy", "database_type": "standalone-mariadb",
+    "mariadb_root_password": "never-shown",
+    "destination": {"server": {"name": "dbhost"}},
+}
+DB_EVENT = {"hostname": "diun-host", "status": "update",
+            "image": "docker.io/library/mariadb:11.8-noble",
+            "metadata": {"ctn_names": DB_UUID}}
+DB_ENV = {"DATABASE_AUTO_DEPLOY": "true"}
+
+
+def _db_burst(events, databases=(STANDALONE_DB,), services=(MATCHING_SERVICE,), **kwargs):
+    with patch("main.get_coolify_databases", new=AsyncMock(return_value=list(databases))) as listing:
+        return (*_burst(events, list(services), **kwargs), listing)
+
+
+def test_database_auto_deploy_is_off_by_default():
+    import main
+    with patch.dict(os.environ, {}, clear=True):
+        assert main.is_database_auto_deploy_enabled() is False
+    with patch.dict(os.environ, {"DATABASE_AUTO_DEPLOY": "true"}, clear=True):
+        assert main.is_database_auto_deploy_enabled() is True
+
+
+def test_find_database_matches_the_container_named_by_its_uuid_and_the_same_tag():
+    import main
+    assert main.find_database([STANDALONE_DB], DB_EVENT["image"], DB_UUID) is STANDALONE_DB
+    assert main.find_database([STANDALONE_DB], DB_EVENT["image"], f"other, {DB_UUID}") is STANDALONE_DB
+
+
+def test_find_database_ignores_another_tag_another_image_or_another_container():
+    import main
+    assert main.find_database([STANDALONE_DB], "mariadb:12.0", DB_UUID) is None
+    assert main.find_database([STANDALONE_DB], "mysql:11.8-noble", DB_UUID) is None
+    assert main.find_database([STANDALONE_DB], DB_EVENT["image"], "mariadb") is None
+    assert main.find_database([], DB_EVENT["image"], DB_UUID) is None
+
+
+def test_an_update_of_a_standalone_database_restarts_it_once_and_reports_it():
+    responses, order, _, notify, _ = _db_burst([DB_EVENT], env=DB_ENV)
+
+    assert responses[0].json() == {"ok": True, "uuid": DB_UUID, "action": "auto-deploy-scheduled"}
+    assert order == [(DB_UUID, ["mariadb-main"])]
+    notify.assert_called_once()
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "1 redeployed" in title
+    assert "dbhost\n - mariadb-main: " in body, "under its Coolify server, by its name"
+    assert "never-shown" not in body
+
+
+def test_two_updates_of_one_database_in_a_window_restart_it_once():
+    responses, order, _, _, _ = _db_burst([DB_EVENT, DB_EVENT], env=DB_ENV)
+
+    assert [r.json()["action"] for r in responses] == ["auto-deploy-scheduled", "auto-deploy-merged"]
+    assert order == [(DB_UUID, ["mariadb-main"])]
+
+
+def test_a_database_is_only_announced_with_a_link_when_database_auto_deploy_is_off():
+    responses, order, _, notify, _ = _db_burst([DB_EVENT])
+
+    assert order == [], "nothing restarted"
+    assert responses[0].json() == {"ok": True, "uuid": DB_UUID}
+    notify.assert_called_once()
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "mariadb-main" in title and "new image available" in title
+    assert "/deploy?uuid=" in body and "dbhost" in body
+    assert not notify.call_args.kwargs.get("info"), \
+        "with AUTO_DEPLOY on, a database left to the user must reach them (NOTIFY_LEVEL=failures)"
+
+
+def test_a_database_announcement_is_plain_information_without_auto_deploy():
+    env = {k: v for k, v in AUTO_DEPLOY_ENV.items() if k != "AUTO_DEPLOY"}
+    with patch.dict(AUTO_DEPLOY_ENV, env, clear=True):
+        _, order, _, notify, _ = _db_burst([DB_EVENT], env=DB_ENV)
+
+    assert order == [], "DATABASE_AUTO_DEPLOY alone redeploys nothing"
+    assert notify.call_args.kwargs.get("info") is True
+
+
+def test_an_image_without_service_or_database_is_reported_as_before():
+    responses, order, _, notify, listing = _db_burst([DB_EVENT], databases=(), env=DB_ENV)
+
+    listing.assert_awaited_once()
+    assert order == []
+    assert responses[0].json() == {"ok": True, "uuid": None}
+    assert "no deploy available" in notify.call_args.args[1]
+    assert not notify.call_args.kwargs.get("info")
+
+
+def test_databases_are_not_listed_when_a_service_matches_or_for_a_new_tag():
+    _, order, _, _, listing = _db_burst([DIUN_PAYLOAD, {**DB_EVENT, "status": "new"}], env=DB_ENV)
+
+    listing.assert_not_awaited()
+    assert order == [("svc-1", ["nextcloud"])]
+
+
+def test_a_database_that_does_not_come_back_is_a_notified_failure():
+    _, order, _, notify, _ = _db_burst(
+        [DB_EVENT], env=DB_ENV,
+        outcomes_by_uuid={DB_UUID: (False, "never came back (last status: exited)")})
+
+    assert len(order) == 1
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "❌" in title and "never came back" in body and "/deploy?uuid=" in body
+    assert not notify.call_args.kwargs.get("info")
+
+
+@patch("main.httpx.AsyncClient")
+def test_a_database_is_restarted_and_watched_through_the_databases_api(mock_client_cls):
+    import asyncio
+    import main
+    resp = MagicMock(status_code=200)
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"message": "Database restarting request queued.", "status": "running:healthy"}
+    http_client = _mock_httpx_post(mock_client_cls, resp=resp)
+    http_client.get = AsyncMock(return_value=resp)
+    main._database_uuids.add(DB_UUID)
+
+    assert asyncio.run(main.trigger_coolify("http://coolify", "tok", DB_UUID))["ok"] is True
+    assert http_client.post.await_args.args[0] == f"http://coolify/api/v1/databases/{DB_UUID}/restart"
+    assert asyncio.run(main.get_service_status("http://coolify", "tok", DB_UUID)) == "running:healthy"
+    assert http_client.get.await_args.args[0] == f"http://coolify/api/v1/databases/{DB_UUID}"
+
+    asyncio.run(main.trigger_coolify("http://coolify", "tok", "svc-1"))
+    assert http_client.post.await_args.args[0] == "http://coolify/api/v1/services/svc-1/restart?latest=true"
+
+
+def test_listing_databases_returns_them_and_never_logs_their_content(caplog):
+    import asyncio
+    import logging
+    with caplog.at_level(logging.DEBUG), \
+         patch("main.httpx.AsyncClient", new=_working_coolify_client([STANDALONE_DB])):
+        assert asyncio.run(_real_get_coolify_databases("http://coolify", "tok")) == [STANDALONE_DB]
+    assert "never-shown" not in caplog.text
+
+
+@patch("main.send_notification")
+def test_a_failed_database_listing_is_empty_and_does_not_declare_coolify_down(mock_notify):
+    import asyncio
+    import main
+    _reset_coolify_state()
+    with patch("main.httpx.AsyncClient", new=_failing_coolify_client()):
+        assert asyncio.run(_real_get_coolify_databases("http://coolify", "tok")) == []
+    assert main.coolify_is_down() is False
+    mock_notify.assert_not_called()
+
+
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_manual_deploy_restarts_a_standalone_database(mock_coolify, mock_trigger):
+    import main
+    _reset_redeploy_state()
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": None}
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True), \
+         patch("main.get_coolify_databases", new=AsyncMock(return_value=[STANDALONE_DB])), \
+         patch("main.spawn", new=lambda coro: coro.close()):
+        resp = client.get("/deploy", params={"uuid": DB_UUID, "secret": "s3cret"})
+
+    mock_trigger.assert_awaited_once()
+    assert mock_trigger.await_args.args[2] == DB_UUID
+    assert DB_UUID in main._database_uuids, "so that the restart goes to the databases API"
+    assert "mariadb-main" in resp.text and "dbhost" in resp.text
+    _reset_redeploy_state()
+
+
+def test_replay_restarts_a_missed_database_update():
+    missed = _missed((DB_EVENT["image"], DB_UUID, "update"))
+    with patch("main.get_coolify_databases", new=AsyncMock(return_value=[STANDALONE_DB])):
+        calls, _, notify = _replay(missed, [MATCHING_SERVICE], env=DB_ENV)
+
+    assert calls == [(DB_UUID, ["mariadb-main"], [DB_EVENT["image"]])]
+    assert "1 redeployed" in notify.call_args.args[1]
+    assert "dbhost" in notify.call_args.args[2]
+
+
+def test_replay_only_lists_a_missed_database_update_when_database_auto_deploy_is_off():
+    missed = _missed((DB_EVENT["image"], DB_UUID, "update"))
+    with patch("main.get_coolify_databases", new=AsyncMock(return_value=[STANDALONE_DB])):
+        calls, _, notify = _replay(missed, [MATCHING_SERVICE])
+
+    assert calls == []
+    assert "mariadb-main" in notify.call_args.args[2] and "DATABASE_AUTO_DEPLOY" in notify.call_args.args[2]

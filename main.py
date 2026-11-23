@@ -216,6 +216,9 @@ def log_environment_config():
     # Check auto-deploy
     logger.info(f"AUTO_DEPLOY: {'✓ enabled' if is_auto_deploy_enabled() else '✗ disabled (manual link only)'}")
 
+    logger.info(f"DATABASE_AUTO_DEPLOY: "
+                f"{'✓ enabled' if is_database_auto_deploy_enabled() else '✗ disabled (manual link only)'}")
+
     # Check dispatcher URL
     dispatcher_url = os.getenv("DISPATCHER_URL", "").strip()
     logger.info(f"DISPATCHER_URL: {'✓ configured' if dispatcher_url else '✗ not configured'}")
@@ -322,21 +325,33 @@ async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
     token = os.getenv("COOLIFY_TOKEN", "").strip()
     groups: dict[str, dict] = {}
     notes: list[str] = []
+    databases: list[dict] | None = None
     for image, event in missed.items():
         name = event["container"]
         if event["status"] != "update":
             notes.append(f"• {name}: new version {image_tag(image)} reported, nothing applied")
             continue
+        hostname = event.get("hostname", "unknown")
         matched = find_service_by_image(services, image, name)
         uuid = matched.get("uuid") if matched else None
         if not uuid:
-            notes.append(f"• {name}: no Coolify resource runs {image}")
-            continue
-        configured = find_configured_image(matched, image)
-        if configured and image_tag(configured) != image_tag(image):
-            continue  # another series than the one in service: nothing to do
-        hostname = event.get("hostname", "unknown")
-        server = (matched.get("server") or {}).get("name") or hostname.split(".")[0]
+            if databases is None:
+                databases = await get_coolify_databases(coolify_url, token)
+            matched = find_database(databases, image, name)
+            if not matched:
+                notes.append(f"• {name}: no Coolify resource runs {image}")
+                continue
+            uuid, name = matched["uuid"], matched.get("name") or name
+            if not is_database_auto_deploy_enabled():
+                notes.append(f"• {name}: database on {image}, DATABASE_AUTO_DEPLOY is off"
+                             + build_deploy_link(uuid).replace("\n\n", "\n  "))
+                continue
+            server = database_server_name(matched) or hostname.split(".")[0]
+        else:
+            configured = find_configured_image(matched, image)
+            if configured and image_tag(configured) != image_tag(image):
+                continue  # another series than the one in service: nothing to do
+            server = (matched.get("server") or {}).get("name") or hostname.split(".")[0]
         group = groups.setdefault(uuid, {
             "containers": [], "images": [], "items": [], "uuid": uuid,
             "baseline": matched.get("status", ""),
@@ -395,6 +410,47 @@ async def get_coolify_applications(coolify_url: str, coolify_token: str) -> list
         return []
 
 
+# Standalone databases (a Coolify resource of its own, not part of a service): their
+# uuids, so that a restart and a status read go to /databases instead of /services.
+_database_uuids: set[str] = set()
+
+
+async def get_coolify_databases(coolify_url: str, coolify_token: str) -> list[dict]:
+    """Fetch the standalone databases from Coolify. Empty when the listing fails: it
+    is only read after the services were listed, which is what tells Coolify is down.
+    The payload carries the passwords of the databases: never log it."""
+    url = f"{coolify_url.rstrip('/')}/api/v1/databases"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, headers=_coolify_headers(coolify_token))
+            resp.raise_for_status()
+            data = resp.json()
+            logger.info(f"✓ Coolify databases fetched: {len(data)} database(s)")
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"Could not list the Coolify databases: {type(e).__name__}: {e}")
+        return []
+
+
+def find_database(databases: list[dict], image: str, container_name: str) -> dict | None:
+    """The standalone database Diun reports: Coolify names its container by the uuid of
+    the database, and it must run this very image (same repository, same tag)."""
+    names = [name.strip() for name in container_name.split(",") if name.strip()]
+    for database in databases:
+        configured = database.get("image") or ""
+        if (database.get("uuid") in names and configured
+                and normalize_image(configured) == normalize_image(image)
+                and image_tag(configured) == image_tag(image)):
+            _database_uuids.add(database["uuid"])
+            logger.info(f"Found matching standalone database uuid={database['uuid']} for image={image}")
+            return database
+    return None
+
+
+def database_server_name(database: dict) -> str | None:
+    return ((database.get("destination") or {}).get("server") or {}).get("name")
+
+
 def load_apprise_urls() -> list[str]:
     """
     APPRISE_URLS is a comma-separated list of Apprise URLs.
@@ -410,6 +466,12 @@ AUTO_DEPLOY_TRUTHY = ("true", "1", "yes", "on")
 def is_auto_deploy_enabled() -> bool:
     """AUTO_DEPLOY makes the dispatcher redeploy matched images by itself."""
     return os.getenv("AUTO_DEPLOY", "").strip().lower() in AUTO_DEPLOY_TRUTHY
+
+
+def is_database_auto_deploy_enabled() -> bool:
+    """DATABASE_AUTO_DEPLOY lets AUTO_DEPLOY restart standalone databases too (a
+    restart cuts every site that uses the database for about 30 s)."""
+    return os.getenv("DATABASE_AUTO_DEPLOY", "").strip().lower() in AUTO_DEPLOY_TRUTHY
 
 
 def get_cloudflare_headers() -> dict:
@@ -598,7 +660,11 @@ async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> di
     "pull latest images and restart" — it leaves the compose file untouched, so
     an ordinary restart still deploys the same content as before.
     """
-    url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}/restart?latest=true"
+    if uuid in _database_uuids:
+        # A standalone database: its restart pulls the image by itself
+        url = f"{coolify_url.rstrip('/')}/api/v1/databases/{uuid}/restart"
+    else:
+        url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}/restart?latest=true"
     # Before the request: one that times out may still have reached Coolify
     _last_restart_request[uuid] = time.time()
     cf_headers = get_cloudflare_headers()
@@ -822,8 +888,10 @@ def status_is_at_least(current: str, baseline: str) -> bool:
 
 
 async def get_service_status(coolify_url: str, coolify_token: str, uuid: str) -> str | None:
-    """Read a service's current status ("running:healthy"), or None if unreachable."""
-    url = f"{coolify_url.rstrip('/')}/api/v1/services/{uuid}"
+    """Read the current status ("running:healthy") of a service, or of a standalone
+    database, or None if unreachable."""
+    kind = "databases" if uuid in _database_uuids else "services"
+    url = f"{coolify_url.rstrip('/')}/api/v1/{kind}/{uuid}"
     headers = {"Authorization": f"Bearer {coolify_token}", **get_cloudflare_headers()}
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -2200,6 +2268,7 @@ async def diun_webhook(request: Request):
 
     uuid = None
     matched_service = None
+    database = None
     deploy_link = ""
     if coolify_url and coolify_token:
         if coolify_is_down():
@@ -2209,6 +2278,13 @@ async def diun_webhook(request: Request):
             return coolify_down_response(container_name, image, status, hostname)
         matched_service = find_service_by_image(services, image, container_name)
         uuid = matched_service.get("uuid") if matched_service else None
+        if not uuid and status == "update":
+            # Neither a service nor an application: a standalone database, maybe
+            database = find_database(
+                await get_coolify_databases(coolify_url, coolify_token), image, container_name)
+            if database:
+                uuid = database["uuid"]
+                container_name = database.get("name") or container_name
         if uuid:
             deploy_link = build_deploy_link(uuid)
     else:
@@ -2224,6 +2300,8 @@ async def diun_webhook(request: Request):
         coolify_server = matched_service.get("server", {}).get("name")
         if coolify_server:
             server_display = coolify_server
+    elif database:
+        server_display = database_server_name(database) or server_display
 
     # "new": never a redeploy (see classify_new_tag). Only a tag newer than the
     # one in service is worth a notification; the user adopts it by changing the
@@ -2270,9 +2348,11 @@ async def diun_webhook(request: Request):
 
     # AUTO_DEPLOY ("update" of the tag in service): redeploy by itself, one restart
     # per service for the whole Diun pass, and stay silent until Coolify reports back.
-    if uuid and is_auto_deploy_enabled():
+    # A standalone database only with DATABASE_AUTO_DEPLOY as well: same queue, same lock.
+    database_held = database is not None and not is_database_auto_deploy_enabled()
+    if uuid and is_auto_deploy_enabled() and not database_held:
         action = schedule_service_redeploy(
-            coolify_url, coolify_token, uuid, matched_service.get("status", ""),
+            coolify_url, coolify_token, uuid, (matched_service or database).get("status", ""),
             container_name, image, server_display, deploy_link)
         return JSONResponse({"ok": True, "uuid": uuid, "action": action})
 
@@ -2282,7 +2362,10 @@ async def diun_webhook(request: Request):
     # Coolify is configured but runs nothing for this image: Diun watches something the
     # dispatcher cannot act on, which is a problem to look at, not an announcement.
     unknown_to_coolify = bool(coolify_url and coolify_token) and not uuid
-    send_notification(apprise_urls, title, body, info=not unknown_to_coolify)
+    # A database held back while the rest redeploys by itself waits for the user: that
+    # must reach them even with NOTIFY_LEVEL=failures.
+    needs_the_user = unknown_to_coolify or (database_held and is_auto_deploy_enabled())
+    send_notification(apprise_urls, title, body, info=not needs_the_user)
 
     return JSONResponse({"ok": True, "uuid": uuid})
 
@@ -2323,6 +2406,20 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
 
     services = await get_coolify_applications(coolify_url, coolify_token)
     deployment = find_deployment_by_uuid(services, resolved_uuid)
+    baseline = next((s.get("status", "") for s in services if s.get("uuid") == resolved_uuid), "")
+    if not deployment and not coolify_is_down():
+        database = next((d for d in await get_coolify_databases(coolify_url, coolify_token)
+                         if d.get("uuid") == resolved_uuid), None)
+        if database:
+            _database_uuids.add(resolved_uuid)
+            baseline = database.get("status", "")
+            deployment = {
+                "container_name": database.get("name", "unknown"),
+                "image": database.get("image", "unknown"),
+                "hostname": database_server_name(database) or "unknown",
+                "uuid": resolved_uuid,
+                "type": "standalone database",
+            }
     lock = service_restart_lock(resolved_uuid)
     # A pending automatic redeploy counts too: the request would otherwise
     # queue behind it and hang for the whole restart.
@@ -2344,8 +2441,6 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
             lock.release()
             raise
         if deployed:
-            baseline = next((s.get("status", "") for s in services
-                             if s.get("uuid") == resolved_uuid), "")
             spawn(_release_when_back(coolify_url, coolify_token, resolved_uuid,
                                      baseline, container_name, lock))
         else:

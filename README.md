@@ -64,6 +64,7 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | Variable              | Default | Description |
 |-----------------------|---------|-------------|
 | `AUTO_DEPLOY`         | `false` | Redeploy matched images automatically instead of only sending a deploy link (`true`/`1`/`yes`/`on`). See [Automatic deployments](#automatic-deployments) |
+| `DATABASE_AUTO_DEPLOY` | `false` | With `AUTO_DEPLOY`, also restart [standalone databases](#standalone-databases) by itself (`true`/`1`/`yes`/`on`). Off: a notification with a deploy link |
 | `DEPLOY_DEBOUNCE_SECONDS` | `60` | The batch window: the first automatic redeploy waits this long for the other updates of the same Diun burst; they are then redeployed one service at a time and reported in one message. See [Bursts](#bursts-one-window-one-service-at-a-time-one-report) |
 | `DEPLOY_PAUSE_SECONDS` | `20` | Pause between two services redeployed one after the other (a burst, or the replay after a Coolify outage) |
 | `WEBHOOK_SECRET`      | (none)  | Shared secret for webhook validation (validates `X-Diun-Secret` header) |
@@ -151,6 +152,26 @@ With `AUTO_DEPLOY=true`, a Diun **`update`** event that matches a Coolify servic
 triggers the redeploy by itself — no click needed — after a short wait
 (`DEPLOY_DEBOUNCE_SECONDS`, see [Bursts](#bursts-one-window-one-service-at-a-time-one-report)). `IGNORE_CONTAINERS` still wins: an
 ignored container is never deployed automatically.
+
+### Standalone databases
+
+A database created in Coolify as a resource of its own (not inside a service) is found
+when no service runs the image: Diun reports its container under the **uuid of the
+database**, and the database must run the very image reported (same repository, same
+tag). Only an `update` is looked up; the tag is never changed.
+
+- `AUTO_DEPLOY=true` and `DATABASE_AUTO_DEPLOY=true`: the database is restarted
+  (`POST /api/v1/databases/{uuid}/restart`, which pulls the image), through the same
+  queue as the services: same window, one resource at a time, one restart for several
+  updates, same lock, followed until its status is back, one line in the common report
+  (`- mariadb-main: 11.8.3 ⇒ 11.8.4 ✅`). A database that does not come back is a failure.
+- otherwise: one notification with a deploy link, and nothing is restarted. With
+  `AUTO_DEPLOY` on, it is sent even with `NOTIFY_LEVEL=failures`, since everything else
+  redeploys by itself and this one waits for you.
+
+`DATABASE_AUTO_DEPLOY` is off by default because a restart cuts every site that uses the
+database for about 30 s. The Coolify token must be allowed to list and restart databases.
+The `/deploy` link works for a standalone database too.
 
 ### `update` deploys, `new` only informs
 
