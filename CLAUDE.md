@@ -14,7 +14,7 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (301 tests, environ 2 s).
+- Tests : `.venv/bin/python -m pytest -q` (316 tests, environ 2 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
@@ -74,6 +74,12 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   `AUTO_DEPLOY` **et** `DATABASE_AUTO_DEPLOY` (défaut `false`) ; sinon annonce avec lien, envoyée même en
   `NOTIFY_LEVEL=failures` si `AUTO_DEPLOY` est actif. `GET /api/v1/databases` contient les mots de passe
   des bases : ne jamais journaliser sa réponse. `_database_uuids` aiguille restart et statut vers `/databases`.
+- Conteneur annexe d'une application compose (issue #22, `db-<uuid appli>-<horodatage>`) : cherché en dernier
+  (service, puis base autonome, puis `find_application_by_container` via `GET /applications`), pour un `update`
+  seulement. Avec `AUTO_DEPLOY` seul, l'application est redéployée par `POST /deploy?uuid=` (`trigger_coolify`
+  aiguille via `_application_uuids`) et suivie par `wait_for_application_deployment`, dans la même file que les
+  services (un seul déploiement pour plusieurs conteneurs annexes). Pas de coordination avec `rebuild_applications`
+  (aucun verrou commun) : une reconstruction sur image de base et ce déploiement peuvent se chevaucher.
 - Image de base : reconstruction une à une, arrêt au premier échec, autre majeure = annonce. Un redémarrage du dispatcher au milieu d'une reconstruction la reprend au démarrage suivant (`rebuild_state.json` dans `/data`, volume obligatoire) : ne pas redéployer le dispatcher n'est plus nécessaire, mais le déploiement en cours se termine côté Coolify. Ne jamais afficher `WEBHOOK_SECRET` ni le jeton Coolify (ni dans les journaux).
 
 ## Reprise de session

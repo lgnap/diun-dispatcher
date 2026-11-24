@@ -20,10 +20,12 @@ def _isolated_image_versions(tmp_path):
     with patch.object(main, "VERSIONS_FILE", tmp_path / "image_versions.json"), \
          patch.object(main, "REBUILD_STATE_FILE", tmp_path / "rebuild_state.json"), \
          patch.object(main, "current_image_version", new=AsyncMock(return_value=None)), \
-         patch.object(main, "get_coolify_databases", new=AsyncMock(return_value=[])):
+         patch.object(main, "get_coolify_databases", new=AsyncMock(return_value=[])), \
+         patch.object(main, "get_application_names", new=AsyncMock(return_value={})):
         yield
     main._image_versions.clear()
     main._database_uuids.clear()
+    main._application_uuids.clear()
 
 
 def test_get_cloudflare_headers_with_both_credentials():
@@ -3588,3 +3590,181 @@ def test_replay_only_lists_a_missed_database_update_when_database_auto_deploy_is
 
     assert calls == []
     assert "mariadb-main" in notify.call_args.args[2] and "DATABASE_AUTO_DEPLOY" in notify.call_args.args[2]
+
+
+# ============================================================================
+# A side container of a compose application (issue #22): Coolify names it
+# <service>-<application uuid>-<timestamp>, and no Coolify service runs its image.
+# ============================================================================
+
+APP_UUID = "ap00000000000000000000aa"
+APP_NAMES = {APP_UUID: "shop"}
+SIDE_DB_EVENT = {"hostname": "diun-host", "status": "update",
+                 "image": "docker.io/library/mysql:8.4",
+                 "metadata": {"ctn_names": f"db-{APP_UUID}-20261027T170121"}}
+SIDE_CACHE_EVENT = {"hostname": "diun-host", "status": "update",
+                    "image": "docker.io/library/redis:7-alpine",
+                    "metadata": {"ctn_names": f"redis-{APP_UUID}-20261027T170121"}}
+
+
+def _app_burst(events, names=APP_NAMES, **kwargs):
+    with patch("main.get_application_names", new=AsyncMock(return_value=dict(names))) as listing:
+        return (*_burst(events, [MATCHING_SERVICE], **kwargs), listing)
+
+
+def test_find_application_by_container_reads_the_uuid_before_the_timestamp():
+    import main
+    assert main.find_application_by_container(APP_NAMES, f"db-{APP_UUID}-20261027T170121") == APP_UUID
+    assert main.find_application_by_container(
+        APP_NAMES, f"x, my-cache-{APP_UUID}-20261027T170121") == APP_UUID
+
+
+def test_find_application_by_container_ignores_other_names():
+    import main
+    assert main.find_application_by_container(APP_NAMES, "db-zz00000000000000000000zz-20261027T170121") is None
+    assert main.find_application_by_container(APP_NAMES, f"db-{APP_UUID}") is None, "no timestamp"
+    assert main.find_application_by_container(APP_NAMES, "mysql") is None
+    assert main.find_application_by_container({}, f"db-{APP_UUID}-20261027T170121") is None
+
+
+def test_an_update_of_a_side_container_deploys_its_application():
+    responses, order, _, notify, _ = _app_burst([SIDE_DB_EVENT])
+
+    assert responses[0].json() == {"ok": True, "uuid": APP_UUID, "action": "auto-deploy-scheduled"}
+    assert order == [(APP_UUID, [f"db-{APP_UUID}-20261027T170121"])]
+    notify.assert_called_once()
+    assert "1 redeployed" in notify.call_args.args[1]
+    assert "no deploy available" not in notify.call_args.args[1]
+
+
+def test_two_side_containers_of_one_application_deploy_it_once():
+    responses, order, _, notify, _ = _app_burst([SIDE_DB_EVENT, SIDE_CACHE_EVENT])
+
+    assert [r.json()["action"] for r in responses] == ["auto-deploy-scheduled", "auto-deploy-merged"]
+    assert len(order) == 1 and order[0][0] == APP_UUID
+    assert len(order[0][1]) == 2
+    notify.assert_called_once()
+
+
+def test_a_container_of_no_known_application_keeps_the_old_behaviour():
+    responses, order, _, notify, listing = _app_burst(
+        [SIDE_DB_EVENT], names={"zz00000000000000000000zz": "other"})
+
+    listing.assert_awaited_once()
+    assert order == []
+    assert responses[0].json() == {"ok": True, "uuid": None}
+    assert "no deploy available" in notify.call_args.args[1]
+
+
+def test_a_new_tag_of_a_side_container_deploys_nothing():
+    responses, order, _, notify, listing = _app_burst([{**SIDE_DB_EVENT, "status": "new"}])
+
+    listing.assert_not_awaited()
+    assert order == []
+    assert responses[0].json()["uuid"] is None
+
+
+def test_applications_are_not_listed_when_a_service_matches():
+    _, order, _, _, listing = _app_burst([DIUN_PAYLOAD])
+
+    listing.assert_not_awaited()
+    assert order == [("svc-1", ["nextcloud"])]
+
+
+def test_a_side_container_is_only_announced_with_a_link_without_auto_deploy():
+    env = {k: v for k, v in AUTO_DEPLOY_ENV.items() if k != "AUTO_DEPLOY"}
+    with patch.dict(AUTO_DEPLOY_ENV, env, clear=True):
+        responses, order, _, notify, _ = _app_burst([SIDE_DB_EVENT])
+
+    assert order == []
+    assert responses[0].json() == {"ok": True, "uuid": APP_UUID}
+    title, body = notify.call_args.args[1], notify.call_args.args[2]
+    assert "new image available" in title and "/deploy?uuid=" in body
+    assert notify.call_args.kwargs.get("info") is True
+
+
+def test_an_application_that_fails_to_deploy_is_a_notified_failure():
+    _, order, _, notify, _ = _app_burst(
+        [SIDE_DB_EVENT], outcomes_by_uuid={APP_UUID: (False, "deployment failed")})
+
+    assert len(order) == 1
+    assert "❌" in notify.call_args.args[1] and "deployment failed" in notify.call_args.args[2]
+    assert not notify.call_args.kwargs.get("info")
+
+
+def _redeploy_application(status, deployment_uuid="dep-1"):
+    import asyncio
+    import main
+    main._application_uuids.add(APP_UUID)
+    pending = {"containers": ["db"], "images": ["mysql:8.4"], "uuid": APP_UUID,
+               "baseline": "", "server": "host", "deploy_link": ""}
+    outcomes = []
+    with patch("main.deploy_application", new=AsyncMock(return_value=deployment_uuid)) as deploy, \
+         patch("main.wait_for_application_deployment", new=AsyncMock(return_value=status)) as wait, \
+         patch("main.get_service_status", new=AsyncMock()) as service_status:
+        asyncio.run(main._redeploy("http://coolify", "tok", APP_UUID, pending, outcomes=outcomes))
+    return outcomes, deploy, wait, service_status
+
+
+def test_redeploy_of_an_application_deploys_it_and_follows_the_deployment():
+    outcomes, deploy, wait, service_status = _redeploy_application("finished")
+
+    deploy.assert_awaited_once()
+    assert wait.await_args.args[2] == "dep-1"
+    service_status.assert_not_awaited()
+    assert outcomes[0][:3] == ("db", "mysql:8.4", True)
+
+
+def test_redeploy_of_an_application_reports_a_failed_deployment():
+    outcomes, *_ = _redeploy_application("failed")
+    assert outcomes[0][2] is False and "failed" in outcomes[0][3]
+
+
+def test_redeploy_of_an_application_refused_by_coolify_is_a_failure():
+    outcomes, _, wait, _ = _redeploy_application("finished", deployment_uuid=None)
+    wait.assert_not_awaited()
+    assert outcomes[0][2] is False and "could not be triggered" in outcomes[0][3]
+
+
+@patch("main.trigger_coolify", new_callable=AsyncMock)
+@patch("main.get_coolify_applications", new_callable=AsyncMock)
+def test_manual_deploy_deploys_an_application(mock_coolify, mock_trigger):
+    import main
+    _reset_redeploy_state()
+    mock_coolify.return_value = [MATCHING_SERVICE]
+    mock_trigger.return_value = {"ok": True, "deployment_uuid": "dep-1"}
+    with patch.dict(os.environ, AUTO_DEPLOY_ENV, clear=True), \
+         patch("main.get_application_names", new=AsyncMock(return_value=APP_NAMES)), \
+         patch("main.spawn", new=lambda coro: coro.close()):
+        resp = client.get("/deploy", params={"uuid": APP_UUID, "secret": "s3cret"})
+
+    mock_trigger.assert_awaited_once()
+    assert APP_UUID in main._application_uuids, "so that the trigger goes to the deploy API"
+    assert "shop" in resp.text
+    _reset_redeploy_state()
+
+
+@patch("main.httpx.AsyncClient")
+def test_trigger_of_an_application_queues_a_deployment(mock_client_cls):
+    import asyncio
+    import main
+    resp = MagicMock(status_code=200)
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"deployments": [{"deployment_uuid": "dep-1"}]}
+    http_client = _mock_httpx_post(mock_client_cls, resp=resp)
+    main._application_uuids.add(APP_UUID)
+
+    result = asyncio.run(main.trigger_coolify("http://coolify", "tok", APP_UUID))
+    assert result == {"ok": True, "deployment_uuid": "dep-1"}
+    assert http_client.post.await_args.args[0] == "http://coolify/api/v1/deploy"
+    assert http_client.post.await_args.kwargs["params"] == {"uuid": APP_UUID}
+
+
+def test_replay_deploys_the_application_of_a_missed_side_container_update():
+    missed = _missed((SIDE_DB_EVENT["image"], SIDE_DB_EVENT["metadata"]["ctn_names"], "update"),
+                     (SIDE_CACHE_EVENT["image"], SIDE_CACHE_EVENT["metadata"]["ctn_names"], "update"))
+    with patch("main.get_application_names", new=AsyncMock(return_value=APP_NAMES)):
+        calls, _, notify = _replay(missed, [MATCHING_SERVICE])
+
+    assert len(calls) == 1 and calls[0][0] == APP_UUID and len(calls[0][1]) == 2
+    assert "1 redeployed" in notify.call_args.args[1]

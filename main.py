@@ -326,6 +326,7 @@ async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
     groups: dict[str, dict] = {}
     notes: list[str] = []
     databases: list[dict] | None = None
+    applications: dict[str, str] | None = None
     for image, event in missed.items():
         name = event["container"]
         if event["status"] != "update":
@@ -338,15 +339,22 @@ async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
             if databases is None:
                 databases = await get_coolify_databases(coolify_url, token)
             matched = find_database(databases, image, name)
-            if not matched:
-                notes.append(f"• {name}: no Coolify resource runs {image}")
-                continue
-            uuid, name = matched["uuid"], matched.get("name") or name
-            if not is_database_auto_deploy_enabled():
-                notes.append(f"• {name}: database on {image}, DATABASE_AUTO_DEPLOY is off"
-                             + build_deploy_link(uuid).replace("\n\n", "\n  "))
-                continue
-            server = database_server_name(matched) or hostname.split(".")[0]
+            if matched:
+                uuid, name = matched["uuid"], matched.get("name") or name
+                if not is_database_auto_deploy_enabled():
+                    notes.append(f"• {name}: database on {image}, DATABASE_AUTO_DEPLOY is off"
+                                 + build_deploy_link(uuid).replace("\n\n", "\n  "))
+                    continue
+                server = database_server_name(matched) or hostname.split(".")[0]
+            else:
+                # A side container of a compose application: deployed with AUTO_DEPLOY alone
+                if applications is None:
+                    applications = await get_application_names(coolify_url, token)
+                uuid = find_application_by_container(applications, name)
+                if not uuid:
+                    notes.append(f"• {name}: no Coolify resource runs {image}")
+                    continue
+                matched, server = {}, hostname.split(".")[0]
         else:
             configured = find_configured_image(matched, image)
             if configured and image_tag(configured) != image_tag(image):
@@ -449,6 +457,28 @@ def find_database(databases: list[dict], image: str, container_name: str) -> dic
 
 def database_server_name(database: dict) -> str | None:
     return ((database.get("destination") or {}).get("server") or {}).get("name")
+
+
+# Compose applications whose side containers (database, cache) Diun reported: their
+# uuids, so that a redeploy goes to /deploy and is followed as a deployment.
+_application_uuids: set[str] = set()
+
+# <service>-<uuid of the application>-<timestamp>, how Coolify names the containers of
+# a compose application
+_SIDE_CONTAINER_RE = re.compile(r"-(?P<uuid>[a-z0-9]+)-\d{8}T\d{6}$")
+
+
+def find_application_by_container(names: dict[str, str], container_name: str) -> str | None:
+    """The uuid of the Coolify application a side container belongs to (a public image
+    such as mysql:8.4 in its compose), None when the container name carries the uuid of
+    no known application. `names` is {uuid: name} as get_application_names returns."""
+    for name in (n.strip() for n in container_name.split(",")):
+        found = _SIDE_CONTAINER_RE.search(name)
+        if found and found["uuid"] in names:
+            _application_uuids.add(found["uuid"])
+            logger.info(f"Found matching application uuid={found['uuid']} for container={name}")
+            return found["uuid"]
+    return None
 
 
 def load_apprise_urls() -> list[str]:
@@ -660,6 +690,11 @@ async def trigger_coolify(coolify_url: str, coolify_token: str, uuid: str) -> di
     "pull latest images and restart" — it leaves the compose file untouched, so
     an ordinary restart still deploys the same content as before.
     """
+    if uuid in _application_uuids:
+        # A compose application with side containers: a deployment pulls them
+        _last_restart_request[uuid] = time.time()
+        deployment_uuid = await deploy_application(coolify_url, coolify_token, uuid)
+        return {"ok": deployment_uuid is not None, "deployment_uuid": deployment_uuid}
     if uuid in _database_uuids:
         # A standalone database: its restart pulls the image by itself
         url = f"{coolify_url.rstrip('/')}/api/v1/databases/{uuid}/restart"
@@ -1269,8 +1304,10 @@ async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: di
                     outcomes: list | None = None) -> None:
     containers = ", ".join(pending["containers"])
     images = ", ".join(pending["images"])
+    is_application = uuid in _application_uuids
     # The listing the webhook saw may date from the middle of another restart
-    baseline = await get_service_status(coolify_url, coolify_token, uuid) or pending["baseline"]
+    baseline = ("" if is_application else
+                await get_service_status(coolify_url, coolify_token, uuid) or pending["baseline"])
     result = await trigger_coolify(coolify_url, coolify_token, uuid)
     if not result["ok"]:
         if outcomes is not None:
@@ -1283,6 +1320,23 @@ async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: di
                                     pending["deploy_link"]),
         )
         return
+    if is_application:
+        # A deployment has an id and a terminal status: no status baseline to come back to
+        logger.info(f"Auto-deploy triggered for {containers} (application {uuid})")
+        outcome = await wait_for_application_deployment(
+            coolify_url, coolify_token, result["deployment_uuid"])
+        if outcomes is not None:
+            outcomes.append((containers, images, outcome == "finished",
+                             "deployed" if outcome == "finished" else f"deployment {outcome}"))
+        elif outcome == "finished":
+            _notify_deployment_done(containers, images, pending["server"], "finished", "")
+        else:
+            send_notification(
+                load_apprise_urls(),
+                f"❌ {containers} — deployment {outcome}",
+                build_notification_body(pending["server"], images, containers,
+                                        pending["deploy_link"]))
+        return
     logger.info(f"Auto-deploy triggered for {containers} (service {uuid}), "
                 f"baseline status={baseline}")
     extra = {} if outcomes is None else {"outcomes": outcomes}
@@ -1293,10 +1347,13 @@ async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: di
 
 async def _release_when_back(coolify_url: str, coolify_token: str, uuid: str,
                              baseline_status: str, container_name: str,
-                             lock: asyncio.Lock) -> None:
+                             lock: asyncio.Lock, deployment_uuid: str | None = None) -> None:
     """Hold a manual redeploy's lock until the service is back (or given up on)."""
     try:
-        await wait_for_service(coolify_url, coolify_token, uuid, baseline_status, container_name)
+        if deployment_uuid and uuid in _application_uuids:
+            await wait_for_application_deployment(coolify_url, coolify_token, deployment_uuid)
+        else:
+            await wait_for_service(coolify_url, coolify_token, uuid, baseline_status, container_name)
         await hold_after_restart(uuid)
     finally:
         lock.release()
@@ -2285,6 +2342,11 @@ async def diun_webhook(request: Request):
             if database:
                 uuid = database["uuid"]
                 container_name = database.get("name") or container_name
+        if not uuid and status == "update":
+            # Not a database either: a side container (database, cache) of a compose
+            # application, named after the uuid of the application
+            uuid = find_application_by_container(
+                await get_application_names(coolify_url, coolify_token), container_name)
         if uuid:
             deploy_link = build_deploy_link(uuid)
     else:
@@ -2352,7 +2414,7 @@ async def diun_webhook(request: Request):
     database_held = database is not None and not is_database_auto_deploy_enabled()
     if uuid and is_auto_deploy_enabled() and not database_held:
         action = schedule_service_redeploy(
-            coolify_url, coolify_token, uuid, (matched_service or database).get("status", ""),
+            coolify_url, coolify_token, uuid, (matched_service or database or {}).get("status", ""),
             container_name, image, server_display, deploy_link)
         return JSONResponse({"ok": True, "uuid": uuid, "action": action})
 
@@ -2420,6 +2482,17 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
                 "uuid": resolved_uuid,
                 "type": "standalone database",
             }
+    if not deployment and not coolify_is_down():
+        application_name = (await get_application_names(coolify_url, coolify_token)).get(resolved_uuid)
+        if application_name:
+            _application_uuids.add(resolved_uuid)
+            deployment = {
+                "container_name": application_name,
+                "image": "unknown",
+                "hostname": "unknown",
+                "uuid": resolved_uuid,
+                "type": "application with side containers",
+            }
     lock = service_restart_lock(resolved_uuid)
     # A pending automatic redeploy counts too: the request would otherwise
     # queue behind it and hang for the whole restart.
@@ -2436,13 +2509,15 @@ async def manual_deploy(request: Request, uuid: str, secret: str = ""):
         # Trigger deployment, and keep the service locked until it is back
         await lock.acquire()
         try:
-            deployed = (await trigger_coolify(coolify_url, coolify_token, resolved_uuid))["ok"]
+            result = await trigger_coolify(coolify_url, coolify_token, resolved_uuid)
+            deployed = result["ok"]
         except BaseException:
             lock.release()
             raise
         if deployed:
             spawn(_release_when_back(coolify_url, coolify_token, resolved_uuid,
-                                     baseline, container_name, lock))
+                                     baseline, container_name, lock,
+                                     result.get("deployment_uuid")))
         else:
             # Refused or timed out: Coolify may still have accepted it
             spawn(_release_after_hold(resolved_uuid, lock))
