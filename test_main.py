@@ -4245,3 +4245,125 @@ def test_resume_does_not_go_through_the_grouping_window():
         triggered, _ = _resume_and_run(env={**STATE_ENV, "DEPLOY_DEBOUNCE_SECONDS": "7"})
     assert triggered == ["svc-1"]
     assert 7 not in slept and 7.0 not in slept
+
+
+# ---------------------------------------------------------------------------
+# Issue #24, third review: no second restart at resume, `since`, unwritable state
+# ---------------------------------------------------------------------------
+
+def _requested_ago(seconds, uuid="svc-1"):
+    """Edit the file: the restart of `uuid` was requested `seconds` ago (None: never)."""
+    import main
+    state = _state()
+    for entry in state["redeploys"]:
+        if entry["uuid"] == uuid:
+            if seconds is None:
+                entry.pop("requested", None)
+            else:
+                entry["requested"] = time.time() - seconds
+    main.PENDING_STATE_FILE.write_text(json.dumps(state))
+
+
+def _resume_recording_sleeps():
+    """Resume, with every sleep recorded; also what the trigger saw when it ran."""
+    import main
+    log = []
+
+    async def sleep(seconds):
+        log.append(("sleep", seconds, main.service_restart_lock("svc-1").locked(),
+                    "svc-1" in main._pending_redeploys))
+
+    async def trigger(url, token, uuid):
+        log.append(("trigger", uuid))
+        return {"ok": True, "deployment_uuid": None}
+
+    with patch("main.asyncio.sleep", new=sleep):
+        _resume_and_run(trigger=trigger)
+    return log, [e[1] for e in log if e[0] == "trigger"]
+
+
+def test_resume_waits_for_the_rest_of_the_hold_after_a_recent_request():
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    _requested_ago(30)
+    log, triggered = _resume_recording_sleeps()
+    assert triggered == ["svc-1"], "one restart only"
+    assert log[0][0] == "sleep" and log[0][1] == pytest.approx(270, abs=3)
+    assert log.index(("trigger", "svc-1")) > 0, "no call to Coolify before the wait"
+    assert log[0][2] is True, "the service lock is held during the wait (/deploy refused)"
+
+
+def test_resume_does_not_wait_when_the_request_is_older_than_the_hold():
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    _requested_ago(6 * 60)
+    log, triggered = _resume_recording_sleeps()
+    assert triggered == ["svc-1"]
+    assert [e for e in log if e[0] == "sleep"] == []
+
+
+def test_resume_does_not_wait_for_an_entry_never_requested():
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    _requested_ago(None)
+    log, triggered = _resume_recording_sleeps()
+    assert triggered == ["svc-1"]
+    assert [e for e in log if e[0] == "sleep"] == []
+
+
+def test_the_request_time_is_on_disk_while_coolify_is_being_called():
+    import asyncio
+    import main
+    _forget_memory()
+    seen = []
+
+    async def trigger(url, token, uuid):
+        seen.append(_state()["redeploys"][0].get("requested"))
+        raise asyncio.CancelledError()  # stopped during the call
+
+    spawned = []
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.send_notification"):
+        before = time.time()
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        try:
+            _run_spawned(spawned)
+        except asyncio.CancelledError:
+            pass
+    assert seen and seen[0] >= before, "written before the call"
+    assert _state()["redeploys"][0]["requested"] == seen[0], "still there after the stop"
+
+
+def test_merging_keeps_the_most_recent_since_and_request_time():
+    import main
+    base = {"uuid": "svc-1", "containers": ["a"], "images": ["a:1"], "items": [("a", "a:1")],
+            "baseline": "", "server": "srv"}
+    merged = main._merge_entries([{**base, "since": 100.0, "requested": 500.0},
+                                  {**base, "since": 900.0, "requested": 300.0}])
+    assert merged[0]["since"] == 900.0 and merged[0]["requested"] == 500.0
+    merged = main._merge_entries([{**base, "since": 900.0}, {**base, "since": 100.0, "requested": 7.0}])
+    assert merged[0]["since"] == 900.0 and merged[0]["requested"] == 7.0
+
+
+def test_the_dispatcher_does_not_restart_itself_when_its_state_cannot_be_written():
+    _forget_memory()
+    triggered, notes = [], []
+
+    async def trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification", new=lambda urls, title, body, **k: notes.append((title, body, k))):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest",
+                  deploy_link="\n\nhttp://d/deploy?uuid=x")
+        with patch("main._save_pending_state", return_value=False):
+            _run_spawned(spawned)
+    assert triggered == [], "the dispatcher stays up"
+    failures = [n for n in notes if n[2].get("info") is not True]
+    assert failures and "http://d/deploy?uuid=x" in failures[-1][1]

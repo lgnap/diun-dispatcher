@@ -1138,6 +1138,9 @@ async def run_redeploys(coolify_url: str, coolify_token: str, next_group) -> lis
             del _pending_redeploys[uuid]
         outcomes: list[tuple[str, str, bool, str]] = []
         try:
+            if pending.get("requested"):
+                # Resumed after a request that may have been accepted: let the hold run out
+                await hold_after_restart(uuid)
             await _redeploy(coolify_url, coolify_token, uuid, pending, outcomes=outcomes)
         except Exception as e:
             logger.exception(f"Redeploy of {pending['containers']} failed")
@@ -1227,7 +1230,8 @@ _unconfirmed: list[dict] = []
 
 def _merge_entries(entries: list[dict]) -> list[dict]:
     """One record per uuid, in the order of first appearance: the containers, images and
-    items of the entries sharing a uuid are united without duplicates, `since` is the oldest."""
+    items of the entries sharing a uuid are united without duplicates, `since` and the time
+    of the last restart request (`requested`, 0 = never) are the most recent."""
     merged: dict[str, dict] = {}
     for p in entries:
         record = merged.get(p["uuid"])
@@ -1235,34 +1239,40 @@ def _merge_entries(entries: list[dict]) -> list[dict]:
             merged[p["uuid"]] = {
                 "uuid": p["uuid"], "containers": list(p["containers"]), "images": list(p["images"]),
                 "items": [tuple(item) for item in p["items"]], "baseline": p.get("baseline", ""),
-                "server": p.get("server", "unknown"), "since": p.get("since", time.time())}
+                "server": p.get("server", "unknown"), "since": p.get("since", time.time()),
+                "requested": p.get("requested", 0)}
             continue
         record["containers"] += [c for c in p["containers"] if c not in record["containers"]]
         record["images"] += [i for i in p["images"] if i not in record["images"]]
         record["items"] += [t for t in map(tuple, p["items"]) if t not in record["items"]]
-        record["since"] = min(record["since"], p.get("since", record["since"]))
+        record["since"] = max(record["since"], p.get("since", record["since"]))
+        record["requested"] = max(record["requested"], p.get("requested", 0))
     return list(merged.values())
 
 
-def _save_pending_state() -> None:
+def _save_pending_state() -> bool:
     """Write the unconfirmed restarts and the missed updates; no file when both are empty.
-    Written beside the file then renamed, so a stop never leaves a half-written file."""
+    Written beside the file then renamed, so a stop never leaves a half-written file.
+    False if it could not be written (logged)."""
     try:
         if not _unconfirmed and not _coolify_missed:
             PENDING_STATE_FILE.unlink(missing_ok=True)
-            return
+            return True
         redeploys = [{
             "uuid": p["uuid"], "containers": p["containers"], "images": p["images"],
             "items": [list(item) for item in p["items"]], "baseline": p["baseline"],
-            "server": p["server"], "since": p["since"], "database": p["uuid"] in _database_uuids,
+            "server": p["server"], "since": p["since"], "requested": p["requested"],
+            "database": p["uuid"] in _database_uuids,
         } for p in _merge_entries(_unconfirmed)]
         PENDING_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         temporary = PENDING_STATE_FILE.with_name(PENDING_STATE_FILE.name + ".tmp")
         temporary.write_text(json.dumps(
             {"redeploys": redeploys, "missed": _coolify_missed}, separators=(",", ":")))
         os.replace(temporary, PENDING_STATE_FILE)
+        return True
     except Exception as e:
         logger.warning(f"Could not save {PENDING_STATE_FILE}: {e}")
+        return False
 
 
 def _track_unconfirmed(pending: dict) -> None:
@@ -1272,17 +1282,17 @@ def _track_unconfirmed(pending: dict) -> None:
     _save_pending_state()
 
 
-def _forget_unconfirmed(pending: dict) -> None:
+def _forget_unconfirmed(pending: dict) -> bool:
     """Coolify accepted this restart (or, for the dispatcher itself, it is about to be
     asked): it is no longer the next start's business. The restart pulls the latest images,
     so it also settles the older entries of the same service that are not waiting for
-    their own restart (a refused one, one cut by an exception)."""
+    their own restart (a refused one, one cut by an exception). False if the file could
+    not be updated."""
     uuid = pending["uuid"]
     before = len(_unconfirmed)
     _unconfirmed[:] = [p for p in _unconfirmed
                        if p is not pending and not (p["uuid"] == uuid and _pending_redeploys.get(uuid) is not p)]
-    if len(_unconfirmed) != before:
-        _save_pending_state()
+    return _save_pending_state() if len(_unconfirmed) != before else True
 
 
 def load_pending_state() -> dict:
@@ -1311,7 +1321,8 @@ def _restore_entries(redeploys) -> list[dict]:
                      "images": [str(i) for i in e["images"]],
                      "items": [(str(n), str(i)) for n, i in e["items"]],
                      "baseline": str(e.get("baseline", "")), "server": str(e.get("server", "unknown")),
-                     "since": float(e.get("since", time.time())), "database": bool(e.get("database"))}
+                     "since": float(e.get("since", time.time())),
+                     "requested": float(e.get("requested", 0)), "database": bool(e.get("database"))}
         except Exception as err:
             logger.warning(f"Ignoring a malformed entry of {PENDING_STATE_FILE}: {type(err).__name__}")
             continue
@@ -1358,6 +1369,10 @@ def resume_pending() -> None:
     if restored:
         logger.info(f"Resuming {len(restored)} redeploy(s) pending at the last stop")
         for pending in restored:
+            if pending["requested"]:
+                # A request may have been accepted without our knowing: the hold counts from it
+                _last_restart_request[pending["uuid"]] = max(
+                    _last_restart_request.get(pending["uuid"], 0), pending["requested"])
             _pending_redeploys[pending["uuid"]] = pending
             _batch_queue.append(pending["uuid"])
             _unconfirmed.append(pending)
@@ -1396,7 +1411,15 @@ async def _restart_self(coolify_url: str, coolify_token: str, uuid: str, pending
         # Forgotten BEFORE the call, unlike the other services: Coolify may stop this very
         # container before the answer is handled (CancelledError), and the replacement
         # would restart itself again, forever. A refusal is notified below, with the link.
-        _forget_unconfirmed(pending)
+        if not _forget_unconfirmed(pending):
+            # Not erased from the file: the next start would restart itself again, for 24 h
+            send_notification(
+                load_apprise_urls(), f"❌ {', '.join(pending['containers'])} — the dispatcher did not restart itself",
+                f"{PENDING_STATE_FILE} could not be written, so restarting the dispatcher "
+                f"could loop. Redeploy it yourself.\n\n"
+                + build_notification_body(pending["server"], ", ".join(pending["images"]),
+                                          ", ".join(pending["containers"]), pending["deploy_link"]))
+            return
         result = await trigger_coolify(coolify_url, coolify_token, uuid)
         if not result["ok"]:
             send_notification(
@@ -1485,6 +1508,9 @@ async def _redeploy(coolify_url: str, coolify_token: str, uuid: str, pending: di
     images = ", ".join(pending["images"])
     # The listing the webhook saw may date from the middle of another restart
     baseline = await get_service_status(coolify_url, coolify_token, uuid) or pending["baseline"]
+    # On disk before the call: a stop during it must leave the time of the request
+    pending["requested"] = time.time()
+    _save_pending_state()
     result = await trigger_coolify(coolify_url, coolify_token, uuid)
     if result["ok"]:
         _forget_unconfirmed(pending)

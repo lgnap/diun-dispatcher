@@ -327,8 +327,13 @@ erased from the file; a standalone database also needs `DATABASE_AUTO_DEPLOY`. A
 unreadable or partly malformed file only logs a warning (the valid entries are still resumed).
 The file holds no secret: deploy links are rebuilt on resume.
 
-Known remaining window: if the dispatcher is stopped while the restart request of a service is
-in flight, that service is restarted a second time at the next start.
+The time of each restart request is written to the file **before** the call to Coolify. A request
+that got no answer (timeout, or the dispatcher stopped during the call) may nevertheless have been
+accepted: the entry is kept, and at the next start the service is not restarted again until the
+5-minute hold has elapsed since that original request (the service stays locked meanwhile, so
+`/deploy` refuses it), so that two restarts never overlap. Entries never requested (stop during the
+grouping window) restart immediately. The only remaining case is a restart accepted by Coolify but
+whose request time could not be written to the file.
 
 When the dispatcher's own service (`COOLIFY_RESOURCE_UUID`, which Coolify injects into the
 container) is part of a batch, it is restarted **last**: after the other services and after the
@@ -338,7 +343,7 @@ notified. This is the one exception to "erased once accepted": the dispatcher's 
 just **before** the request, because Coolify may stop the container before the answer is
 handled and the new container would otherwise restart itself again, in a loop. A refused
 restart is therefore not retried at the next start: the failure notification carries the
-deploy link. The same order applies when the updates are replayed after a Coolify outage. Without `COOLIFY_RESOURCE_UUID` the order is unchanged.
+deploy link. If the state file cannot be written (disk full, read-only `/data`), the dispatcher does **not** restart itself (it would restart at every start for 24 hours): a failure notification with the deploy link is sent instead. The same order applies when the updates are replayed after a Coolify outage. Without `COOLIFY_RESOURCE_UUID` the order is unchanged.
 
 ## Virtual series: follow patches without a series tag
 
