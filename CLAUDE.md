@@ -14,7 +14,7 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (316 tests, environ 2 s).
+- Tests : `.venv/bin/python -m pytest -q` (331 tests, environ 2 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
@@ -76,7 +76,9 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   des bases : ne jamais journaliser sa réponse. `_database_uuids` aiguille restart et statut vers `/databases`.
 - Conteneur annexe d'une application compose (issue #22, `db-<uuid appli>-<horodatage>`) : cherché en dernier
   (service, puis base autonome, puis `find_application_by_container` via `GET /applications`), pour un `update`
-  seulement. Avec `AUTO_DEPLOY` seul, l'application est redéployée par `POST /deploy?uuid=` (`trigger_coolify`
+  seulement, et seulement si le `docker_compose_raw` de l'application (clair ou base64, jamais journalisé) contient
+  la même image, même dépôt ET même tag (sinon « no deploy available » ; compose illisible = pas de déploiement),
+  au webhook comme au rejeu. Le compte rendu n'affiche que le service compose (`db`). Avec `AUTO_DEPLOY` seul, l'application est redéployée par `POST /deploy?uuid=` (`trigger_coolify`
   aiguille via `_application_uuids`) et suivie par `wait_for_application_deployment`, dans la même file que les
   services (un seul déploiement pour plusieurs conteneurs annexes). Pas de coordination avec `rebuild_applications`
   (aucun verrou commun) : une reconstruction sur image de base et ce déploiement peuvent se chevaucher.

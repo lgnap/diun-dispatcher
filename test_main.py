@@ -21,7 +21,8 @@ def _isolated_image_versions(tmp_path):
          patch.object(main, "REBUILD_STATE_FILE", tmp_path / "rebuild_state.json"), \
          patch.object(main, "current_image_version", new=AsyncMock(return_value=None)), \
          patch.object(main, "get_coolify_databases", new=AsyncMock(return_value=[])), \
-         patch.object(main, "get_application_names", new=AsyncMock(return_value={})):
+         patch.object(main, "get_application_names", new=AsyncMock(return_value={})), \
+         patch.object(main, "get_applications", new=AsyncMock(return_value=[])):
         yield
     main._image_versions.clear()
     main._database_uuids.clear()
@@ -3599,6 +3600,15 @@ def test_replay_only_lists_a_missed_database_update_when_database_auto_deploy_is
 
 APP_UUID = "ap00000000000000000000aa"
 APP_NAMES = {APP_UUID: "shop"}
+APP_COMPOSE = """services:
+  web:
+    image: ghcr.io/example/shop:1.0
+  db:
+    image: 'mysql:8.4'
+  redis:
+    image: redis:7-alpine
+"""
+APPLICATIONS = [{"uuid": APP_UUID, "name": "shop", "docker_compose_raw": APP_COMPOSE}]
 SIDE_DB_EVENT = {"hostname": "diun-host", "status": "update",
                  "image": "docker.io/library/mysql:8.4",
                  "metadata": {"ctn_names": f"db-{APP_UUID}-20261027T170121"}}
@@ -3607,24 +3617,66 @@ SIDE_CACHE_EVENT = {"hostname": "diun-host", "status": "update",
                     "metadata": {"ctn_names": f"redis-{APP_UUID}-20261027T170121"}}
 
 
-def _app_burst(events, names=APP_NAMES, **kwargs):
-    with patch("main.get_application_names", new=AsyncMock(return_value=dict(names))) as listing:
+def _app_burst(events, applications=APPLICATIONS, **kwargs):
+    with patch("main.get_applications", new=AsyncMock(return_value=list(applications))) as listing:
         return (*_burst(events, [MATCHING_SERVICE], **kwargs), listing)
 
 
 def test_find_application_by_container_reads_the_uuid_before_the_timestamp():
     import main
-    assert main.find_application_by_container(APP_NAMES, f"db-{APP_UUID}-20261027T170121") == APP_UUID
     assert main.find_application_by_container(
-        APP_NAMES, f"x, my-cache-{APP_UUID}-20261027T170121") == APP_UUID
+        APPLICATIONS, f"db-{APP_UUID}-20261027T170121", "docker.io/library/mysql:8.4") == APP_UUID
+    assert main.find_application_by_container(
+        APPLICATIONS, f"x, my-cache-{APP_UUID}-20261027T170121", "docker.io/library/redis:7-alpine") == APP_UUID
 
 
 def test_find_application_by_container_ignores_other_names():
     import main
-    assert main.find_application_by_container(APP_NAMES, "db-zz00000000000000000000zz-20261027T170121") is None
-    assert main.find_application_by_container(APP_NAMES, f"db-{APP_UUID}") is None, "no timestamp"
-    assert main.find_application_by_container(APP_NAMES, "mysql") is None
-    assert main.find_application_by_container({}, f"db-{APP_UUID}-20261027T170121") is None
+    image = "docker.io/library/mysql:8.4"
+    assert main.find_application_by_container(
+        APPLICATIONS, "db-zz00000000000000000000zz-20261027T170121", image) is None
+    assert main.find_application_by_container(APPLICATIONS, f"db-{APP_UUID}", image) is None, "no timestamp"
+    assert main.find_application_by_container(APPLICATIONS, "mysql", image) is None
+    assert main.find_application_by_container([], f"db-{APP_UUID}-20261027T170121", image) is None
+
+
+def test_find_application_by_container_remembers_the_application_uuid():
+    import main
+    main.find_application_by_container(
+        APPLICATIONS, f"db-{APP_UUID}-20261027T170121", "docker.io/library/mysql:8.4")
+    assert APP_UUID in main._application_uuids
+
+
+def test_find_application_by_container_requires_the_tag_in_the_compose():
+    import main
+    name = f"db-{APP_UUID}-20261027T170121"
+    # mysql:8.0 republished while the compose runs mysql:8.4 (Diun watch_repo)
+    assert main.find_application_by_container(APPLICATIONS, name, "docker.io/library/mysql:8.0") is None
+    assert APP_UUID not in main._application_uuids
+    # another repository
+    assert main.find_application_by_container(APPLICATIONS, name, "docker.io/library/mariadb:8.4") is None
+
+
+def test_find_application_by_container_reads_a_base64_compose():
+    import base64
+    import main
+    encoded = [{"uuid": APP_UUID, "docker_compose_raw": base64.b64encode(APP_COMPOSE.encode()).decode()}]
+    name = f"db-{APP_UUID}-20261027T170121"
+    assert main.find_application_by_container(encoded, name, "docker.io/library/mysql:8.4") == APP_UUID
+    assert main.find_application_by_container(encoded, name, "docker.io/library/mysql:8.0") is None
+
+
+def test_find_application_by_container_does_not_deploy_without_a_readable_compose(caplog):
+    import main
+    name = f"db-{APP_UUID}-20261027T170121"
+    secret = "SECRET_PASSWORD_VALUE"
+    for raw in (None, "", "services: [unclosed", f"not a compose {secret}"):
+        apps = [{"uuid": APP_UUID, "docker_compose_raw": raw}]
+        with caplog.at_level("INFO"):
+            assert main.find_application_by_container(apps, name, "docker.io/library/mysql:8.4") is None
+    assert APP_UUID not in main._application_uuids
+    assert secret not in caplog.text
+    assert "no readable compose" in caplog.text
 
 
 def test_an_update_of_a_side_container_deploys_its_application():
@@ -3648,7 +3700,7 @@ def test_two_side_containers_of_one_application_deploy_it_once():
 
 def test_a_container_of_no_known_application_keeps_the_old_behaviour():
     responses, order, _, notify, listing = _app_burst(
-        [SIDE_DB_EVENT], names={"zz00000000000000000000zz": "other"})
+        [SIDE_DB_EVENT], applications=[{**APPLICATIONS[0], "uuid": "zz00000000000000000000zz"}])
 
     listing.assert_awaited_once()
     assert order == []
@@ -3763,8 +3815,171 @@ def test_trigger_of_an_application_queues_a_deployment(mock_client_cls):
 def test_replay_deploys_the_application_of_a_missed_side_container_update():
     missed = _missed((SIDE_DB_EVENT["image"], SIDE_DB_EVENT["metadata"]["ctn_names"], "update"),
                      (SIDE_CACHE_EVENT["image"], SIDE_CACHE_EVENT["metadata"]["ctn_names"], "update"))
-    with patch("main.get_application_names", new=AsyncMock(return_value=APP_NAMES)):
+    with patch("main.get_applications", new=AsyncMock(return_value=APPLICATIONS)):
         calls, _, notify = _replay(missed, [MATCHING_SERVICE])
 
     assert len(calls) == 1 and calls[0][0] == APP_UUID and len(calls[0][1]) == 2
     assert "1 redeployed" in notify.call_args.args[1]
+
+
+# --- review of issue #22: tag check, real trigger, lock release, report names ---
+
+def test_an_update_of_another_tag_of_a_side_container_deploys_nothing():
+    """mysql:8.0 republished (Diun watch_repo) while the compose runs mysql:8.4."""
+    responses, order, _, notify, _ = _app_burst(
+        [{**SIDE_DB_EVENT, "image": "docker.io/library/mysql:8.0"}])
+
+    assert order == []
+    assert responses[0].json() == {"ok": True, "uuid": None}
+    assert "no deploy available" in notify.call_args.args[1]
+
+
+def test_a_side_container_of_an_application_without_a_compose_is_not_deployed():
+    responses, order, _, _, _ = _app_burst(
+        [SIDE_DB_EVENT], applications=[{"uuid": APP_UUID, "name": "shop"}])
+
+    assert order == []
+    assert responses[0].json() == {"ok": True, "uuid": None}
+
+
+def test_replay_skips_a_side_container_update_of_another_tag():
+    missed = _missed(("docker.io/library/mysql:8.0", SIDE_DB_EVENT["metadata"]["ctn_names"], "update"))
+    with patch("main.get_applications", new=AsyncMock(return_value=APPLICATIONS)):
+        calls, _, notify = _replay(missed, [MATCHING_SERVICE])
+
+    assert calls == []
+    assert "no Coolify resource runs docker.io/library/mysql:8.0" in notify.call_args.args[2]
+
+
+def test_replay_notes_a_side_container_of_no_known_application():
+    missed = _missed((SIDE_DB_EVENT["image"], "db-zz00000000000000000000zz-20261027T170121", "update"))
+    with patch("main.get_applications", new=AsyncMock(return_value=APPLICATIONS)):
+        calls, _, notify = _replay(missed, [MATCHING_SERVICE])
+
+    assert calls == []
+    assert "no Coolify resource runs" in notify.call_args.args[2]
+
+
+def test_a_real_side_container_webhook_triggers_the_deploy_api():
+    """No fake _redeploy: what Coolify is really asked for."""
+    import main
+    resp = MagicMock(status_code=200)
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"deployments": [{"deployment_uuid": "dep-1"}]}
+    with patch("main.httpx.AsyncClient") as mock_client_cls, \
+         patch("main.get_coolify_applications", new=AsyncMock(return_value=[MATCHING_SERVICE])), \
+         patch("main.get_applications", new=AsyncMock(return_value=APPLICATIONS)), \
+         patch("main.wait_for_application_deployment", new=AsyncMock(return_value="finished")) as wait, \
+         patch("main.hold_after_restart", new=AsyncMock()), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.send_notification") as notify:
+        http_client = _mock_httpx_post(mock_client_cls, resp=resp)
+        responses = _post_webhooks([SIDE_DB_EVENT])
+
+    assert responses[0].json()["uuid"] == APP_UUID
+    http_client.post.assert_awaited_once()
+    assert http_client.post.await_args.args[0] == "http://coolify/api/v1/deploy"
+    assert http_client.post.await_args.kwargs["params"] == {"uuid": APP_UUID}
+    assert wait.await_args.args[2] == "dep-1"
+    assert "1 redeployed" in notify.call_args.args[1]
+
+
+def test_release_when_back_follows_the_deployment_of_an_application():
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    main._application_uuids.add(APP_UUID)
+    order = []
+
+    async def wait_deployment(url, token, deployment_uuid, *args, **kwargs):
+        order.append(("deployment", deployment_uuid))
+        return "finished"
+
+    async def wait_service(*args, **kwargs):
+        order.append("service")
+
+    async def hold(uuid):
+        assert lock.locked()
+        order.append("hold")
+
+    async def scenario():
+        await lock.acquire()
+        await main._release_when_back("http://coolify", "tok", APP_UUID, "", "shop", lock,
+                                      deployment_uuid="dep-7")
+
+    lock = main.service_restart_lock(APP_UUID)
+    with patch("main.wait_for_application_deployment", new=wait_deployment), \
+         patch("main.wait_for_service", new=wait_service), \
+         patch("main.hold_after_restart", new=hold):
+        asyncio.run(scenario())
+
+    assert order == [("deployment", "dep-7"), "hold"]
+    assert not lock.locked()
+
+
+@patch("main.httpx.AsyncClient")
+def test_trigger_of_an_application_records_the_restart_request(mock_client_cls):
+    import asyncio
+    import main
+    _reset_redeploy_state()
+    resp = MagicMock(status_code=200)
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"deployments": [{"deployment_uuid": "dep-1"}]}
+    _mock_httpx_post(mock_client_cls, resp=resp)
+    main._application_uuids.add(APP_UUID)
+
+    asyncio.run(main.trigger_coolify("http://coolify", "tok", APP_UUID))
+    assert APP_UUID in main._last_restart_request, "the lock is held a minimum time after it"
+
+
+def _redeploy_application_alone(status, deployment_uuid="dep-1"):
+    import asyncio
+    import main
+    main._application_uuids.add(APP_UUID)
+    pending = {"containers": [f"db-{APP_UUID}-20261027T170121"], "images": ["mysql:8.4"],
+               "uuid": APP_UUID, "baseline": "", "server": "host", "deploy_link": "\n\nLINK"}
+    with patch("main.deploy_application", new=AsyncMock(return_value=deployment_uuid)), \
+         patch("main.wait_for_application_deployment", new=AsyncMock(return_value=status)), \
+         patch("main.send_notification") as notify:
+        asyncio.run(main._redeploy("http://coolify", "tok", APP_UUID, pending))
+    return notify
+
+
+def test_redeploy_of_an_application_alone_notifies_its_success_as_info():
+    notify = _redeploy_application_alone("finished")
+
+    notify.assert_called_once()
+    assert "✅" in notify.call_args.args[1] and "deployed" in notify.call_args.args[1]
+    assert notify.call_args.kwargs.get("info") is True
+
+
+def test_redeploy_of_an_application_alone_notifies_its_failure_not_as_info():
+    notify = _redeploy_application_alone("failed")
+
+    notify.assert_called_once()
+    assert "❌" in notify.call_args.args[1] and "deployment failed" in notify.call_args.args[1]
+    assert not notify.call_args.kwargs.get("info")
+
+
+def test_redeploy_of_an_application_alone_refused_by_coolify_is_a_failure():
+    notify = _redeploy_application_alone("finished", deployment_uuid=None)
+
+    notify.assert_called_once()
+    assert "❌" in notify.call_args.args[1] and not notify.call_args.kwargs.get("info")
+
+
+def test_the_report_shows_the_compose_service_of_a_side_container():
+    import asyncio
+    import main
+    main._application_uuids.add(APP_UUID)
+    container = f"db-{APP_UUID}-20261027T170121"
+    pending = {"uuid": APP_UUID, "server": "host", "deploy_link": "",
+               "items": [(container, "mysql:8.4")]}
+    with patch("main.send_notification") as notify:
+        asyncio.run(main.send_redeploy_report(
+            [(pending, (container, "mysql:8.4", True, "deployed"))], [], heading="",
+            always=False, ok_is_info=True))
+
+    body = notify.call_args.args[2]
+    assert " - db: " in body
+    assert APP_UUID not in body and "2026" not in body

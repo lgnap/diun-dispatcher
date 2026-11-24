@@ -326,7 +326,7 @@ async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
     groups: dict[str, dict] = {}
     notes: list[str] = []
     databases: list[dict] | None = None
-    applications: dict[str, str] | None = None
+    applications: list[dict] | None = None
     for image, event in missed.items():
         name = event["container"]
         if event["status"] != "update":
@@ -349,8 +349,8 @@ async def replay_missed(services: list[dict], missed: dict[str, dict]) -> None:
             else:
                 # A side container of a compose application: deployed with AUTO_DEPLOY alone
                 if applications is None:
-                    applications = await get_application_names(coolify_url, token)
-                uuid = find_application_by_container(applications, name)
+                    applications = await get_applications(coolify_url, token)
+                uuid = find_application_by_container(applications, name, image)
                 if not uuid:
                     notes.append(f"• {name}: no Coolify resource runs {image}")
                     continue
@@ -468,16 +468,48 @@ _application_uuids: set[str] = set()
 _SIDE_CONTAINER_RE = re.compile(r"-(?P<uuid>[a-z0-9]+)-\d{8}T\d{6}$")
 
 
-def find_application_by_container(names: dict[str, str], container_name: str) -> str | None:
+def compose_images(raw: str | None) -> list[str] | None:
+    """The image of every service of a compose file, None when the file is missing or
+    unreadable. Coolify may hand the file over base64-encoded as well as plain."""
+    if not raw or not raw.strip():
+        return None
+    candidates = [raw]
+    try:
+        candidates.append(base64.b64decode(raw, validate=True).decode())
+    except ValueError:  # not base64 (binascii.Error and UnicodeDecodeError)
+        pass
+    for text in candidates:
+        services = _load_compose(text).get("services")
+        if isinstance(services, dict):
+            return [str(service["image"]).strip() for service in services.values()
+                    if isinstance(service, dict) and service.get("image")]
+    return None
+
+
+def find_application_by_container(applications: list[dict], container_name: str,
+                                  image: str) -> str | None:
     """The uuid of the Coolify application a side container belongs to (a public image
-    such as mysql:8.4 in its compose), None when the container name carries the uuid of
-    no known application. `names` is {uuid: name} as get_application_names returns."""
+    such as mysql:8.4 in its compose). The compose of the application must run this very
+    image (same repository, same tag): only an update of the tag in service redeploys.
+    None when the name carries the uuid of no known application, or when its compose is
+    unreadable (never logged: it may hold secrets)."""
+    by_uuid = {a["uuid"]: a for a in applications if a.get("uuid")}
     for name in (n.strip() for n in container_name.split(",")):
         found = _SIDE_CONTAINER_RE.search(name)
-        if found and found["uuid"] in names:
-            _application_uuids.add(found["uuid"])
-            logger.info(f"Found matching application uuid={found['uuid']} for container={name}")
-            return found["uuid"]
+        application = by_uuid.get(found["uuid"]) if found else None
+        if not application:
+            continue
+        uuid = application["uuid"]
+        images = compose_images(application.get("docker_compose_raw"))
+        if images is None:
+            logger.warning(f"Application {uuid} has no readable compose file: not deployed")
+            continue
+        if any(normalize_image(ref) == normalize_image(image) and image_tag(ref) == image_tag(image)
+               for ref in images):
+            _application_uuids.add(uuid)
+            logger.info(f"Found matching application uuid={uuid} for container={name}")
+            return uuid
+        logger.info(f"Application {uuid} does not run {image} in its compose: not deployed")
     return None
 
 
@@ -1192,6 +1224,8 @@ async def send_redeploy_report(rows: list[tuple[dict, tuple]], notes: list[str],
         items = pending.get("items") or [(name, image)]
         for position, (container, container_image) in enumerate(items):
             display = container.removesuffix(f"-{uuid}") if uuid else container
+            if uuid in _application_uuids:  # <service>-<uuid>-<timestamp>: the service only
+                display = _SIDE_CONTAINER_RE.sub("", container)
             key = image_version_key(container_image)
             new = await current_image_version(container_image)
             if not new:
@@ -1750,17 +1784,24 @@ async def wait_for_application_deployment(coolify_url: str, coolify_token: str, 
         await asyncio.sleep(watch_interval(time.time() - started, grace))
 
 
-async def get_application_names(coolify_url: str, coolify_token: str) -> dict[str, str]:
-    """{uuid: name} of the Coolify applications, {} if Coolify cannot be read."""
+async def get_applications(coolify_url: str, coolify_token: str) -> list[dict]:
+    """The Coolify applications with their compose file, [] if Coolify cannot be read.
+    The payload carries environment data: never log it."""
     url = f"{coolify_url.rstrip('/')}/api/v1/applications"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url, headers=_coolify_headers(coolify_token))
             resp.raise_for_status()
-            return {a["uuid"]: a.get("name") or a["uuid"] for a in resp.json() if a.get("uuid")}
+            return [a for a in resp.json() if isinstance(a, dict) and a.get("uuid")]
     except Exception as e:
         logger.warning(f"Could not list the Coolify applications: {e}")
-        return {}
+        return []
+
+
+async def get_application_names(coolify_url: str, coolify_token: str) -> dict[str, str]:
+    """{uuid: name} of the Coolify applications, {} if Coolify cannot be read."""
+    return {a["uuid"]: a.get("name") or a["uuid"]
+            for a in await get_applications(coolify_url, coolify_token)}
 
 
 # A rebuild cut by a restart of the dispatcher resumes where it stopped: its progress
@@ -2346,7 +2387,7 @@ async def diun_webhook(request: Request):
             # Not a database either: a side container (database, cache) of a compose
             # application, named after the uuid of the application
             uuid = find_application_by_container(
-                await get_application_names(coolify_url, coolify_token), container_name)
+                await get_applications(coolify_url, coolify_token), container_name, image)
         if uuid:
             deploy_link = build_deploy_link(uuid)
     else:
