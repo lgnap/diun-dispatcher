@@ -19,11 +19,14 @@ def _isolated_image_versions(tmp_path):
     main._event_digests.clear()
     with patch.object(main, "VERSIONS_FILE", tmp_path / "image_versions.json"), \
          patch.object(main, "REBUILD_STATE_FILE", tmp_path / "rebuild_state.json"), \
+         patch.object(main, "PENDING_STATE_FILE", tmp_path / "pending_redeploys.json", create=True), \
          patch.object(main, "current_image_version", new=AsyncMock(return_value=None)), \
          patch.object(main, "get_coolify_databases", new=AsyncMock(return_value=[])):
         yield
     main._image_versions.clear()
     main._database_uuids.clear()
+    if hasattr(main, "_unconfirmed"):
+        main._unconfirmed.clear()
 
 
 def test_get_cloudflare_headers_with_both_credentials():
@@ -3588,3 +3591,266 @@ def test_replay_only_lists_a_missed_database_update_when_database_auto_deploy_is
 
     assert calls == []
     assert "mariadb-main" in notify.call_args.args[2] and "DATABASE_AUTO_DEPLOY" in notify.call_args.args[2]
+
+
+# ---------------------------------------------------------------------------
+# Pending redeploys survive a restart of the dispatcher (issue #24)
+# ---------------------------------------------------------------------------
+
+SELF_UUID = "dispatcher-uuid"
+STATE_ENV = {**NO_DEBOUNCE_ENV, "COOLIFY_RESOURCE_UUID": SELF_UUID}
+
+
+def _run_spawned(spawned):
+    import asyncio
+
+    async def run_all():
+        while spawned:
+            await spawned.pop(0)
+
+    asyncio.run(run_all())
+
+
+def _schedule(uuid, container, image, deploy_link="", server="srv"):
+    import main
+    return main.schedule_service_redeploy("http://c", "t", uuid, "running:healthy",
+                                          container, image, server, deploy_link)
+
+
+def _forget_memory():
+    """What a restart of the process does: the memory is gone, the files stay."""
+    import main
+    _reset_redeploy_state()
+    main._unconfirmed.clear()
+    main._coolify_missed.clear()
+    main._database_uuids.clear()
+    main._coolify_down_since = None
+
+
+def test_pending_state_file_holds_no_secret():
+    import main
+    _forget_memory()
+    link = "\n\nhttp://dispatcher/deploy?uuid=svc-1&secret=s3cret-value"
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        _schedule("svc-1", "nextcloud", "nextcloud:34", deploy_link=link)
+    text = main.PENDING_STATE_FILE.read_text()
+    assert "s3cret" not in text and "secret" not in text
+    state = json.loads(text)
+    assert state["redeploys"][0]["uuid"] == "svc-1"
+    assert state["redeploys"][0]["items"] == [["nextcloud", "nextcloud:34"]]
+
+
+def test_dispatcher_is_restarted_after_the_other_services_and_the_report():
+    _forget_memory()
+    timeline = []
+
+    async def trigger(url, token, uuid):
+        timeline.append(("trigger", uuid))
+        return {"ok": True, "deployment_uuid": None}
+
+    def notify(urls, title, body, **kwargs):
+        timeline.append(("report", title))
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification", new=notify):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        _run_spawned(spawned)
+
+    assert [e[:2] if e[0] == "trigger" else e[0] for e in timeline] == [
+        ("trigger", "svc-1"), "report", ("trigger", SELF_UUID)]
+
+
+def test_without_own_uuid_the_order_is_unchanged():
+    _forget_memory()
+    triggered = []
+
+    async def trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification"):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        _run_spawned(spawned)
+
+    assert triggered == [SELF_UUID, "svc-1"]
+
+
+def test_dispatcher_entry_is_erased_once_its_restart_is_accepted():
+    """No restart loop: the entry must be gone before the container is replaced."""
+    import main
+    _forget_memory()
+    seen = {}
+
+    async def trigger(url, token, uuid):
+        seen["during"] = [r["uuid"] for r in json.loads(main.PENDING_STATE_FILE.read_text())["redeploys"]]
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.send_notification"):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _run_spawned(spawned)
+
+    assert seen["during"] == [SELF_UUID], "kept until Coolify accepts"
+    assert not main.PENDING_STATE_FILE.exists() or \
+        json.loads(main.PENDING_STATE_FILE.read_text())["redeploys"] == []
+
+
+def test_a_lone_dispatcher_restart_is_announced_before_it_happens():
+    _forget_memory()
+    timeline = []
+
+    async def trigger(url, token, uuid):
+        timeline.append("trigger")
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.send_notification", new=lambda *a, **k: timeline.append(("notify", k.get("info")))):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _run_spawned(spawned)
+
+    assert timeline == [("notify", True), "trigger"]
+
+
+def test_a_stop_during_the_window_is_resumed_and_reported_at_next_start():
+    import main
+    _forget_memory()
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+    _forget_memory()  # the dispatcher is stopped and started again
+
+    triggered, notes = [], []
+
+    async def trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    async def watch(url, token, uuid, baseline, **kwargs):
+        kwargs["outcomes"].append((kwargs["container_name"], kwargs["image"], True, "deployed"))
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.send_notification", new=lambda urls, title, body, **k: notes.append((title, k))):
+        main.resume_pending()
+        _run_spawned(spawned)
+
+    assert triggered == ["svc-1"]
+    assert len(notes) == 1
+    assert "Resumed" in notes[0][0] and "1 redeployed" in notes[0][0]
+    assert notes[0][1]["info"] is True  # NOTIFY_LEVEL=failures drops a good report
+    assert not main.PENDING_STATE_FILE.exists()  # nothing left to resume
+
+
+def test_a_stop_mid_batch_resumes_at_the_service_not_yet_restarted():
+    import asyncio
+    import main
+    _forget_memory()
+
+    async def trigger(url, token, uuid):
+        if uuid == "svc-2":
+            raise asyncio.CancelledError()  # the process is stopped here
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification"):
+        _schedule("svc-1", "a", "a:1")
+        _schedule("svc-2", "b", "b:1")
+        try:
+            _run_spawned(spawned)
+        except asyncio.CancelledError:
+            pass
+
+    assert [r["uuid"] for r in json.loads(main.PENDING_STATE_FILE.read_text())["redeploys"]] == ["svc-2"]
+
+
+def test_missing_or_unreadable_state_does_not_block_startup(caplog):
+    import main
+    _forget_memory()
+    with patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()  # no file
+        assert main._batch_queue == []
+        main.PENDING_STATE_FILE.write_text("{not json")
+        with caplog.at_level("WARNING"):
+            main.resume_pending()
+    assert main._batch_queue == [] and main._pending_redeploys == {}
+    assert "Could not read" in caplog.text
+    main.PENDING_STATE_FILE.write_text('{"redeploys": "oops", "missed": 3}')
+    with patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()
+    assert main._batch_queue == []
+
+
+def test_resumed_database_entry_still_goes_to_the_databases_api():
+    import main
+    _forget_memory()
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        main._database_uuids.add("db-uuid")
+        _schedule("db-uuid", "db-uuid", "mariadb:11")
+    _forget_memory()
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()
+    assert "db-uuid" in main._database_uuids
+    assert main._batch_queue == ["db-uuid"]
+
+
+def test_missed_updates_are_kept_and_replayed_after_a_restart():
+    import main
+    _forget_memory()
+    main.coolify_down_response("nextcloud", "nextcloud:34", "update", "host")
+    assert json.loads(main.PENDING_STATE_FILE.read_text())["missed"]["nextcloud:34"]["container"] == "nextcloud"
+    _forget_memory()
+    probes = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.probe_coolify_until_back", new=lambda: probes.append(1) or AsyncMock()()), \
+         patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()
+    assert main._coolify_missed["nextcloud:34"]["hostname"] == "host"
+    assert main.coolify_is_down() and probes == [1]
+
+
+def test_coolify_back_empties_the_persisted_missed_list():
+    import main
+    _reset_coolify_state()
+    main.coolify_down_response("nextcloud", "nextcloud:34", "update", "host")
+    with patch("main.spawn", new=lambda c: c.close()), patch("main.send_notification"):
+        main._coolify_down_since = 1.0
+        main._coolify_up([])
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_missed_updates_stay_on_disk_until_their_replay_has_taken_them_over():
+    import main
+    _reset_coolify_state()
+    main.coolify_down_response("nextcloud", "nextcloud:34", "update", "host")
+    # Coolify is back, but the dispatcher stops before the replay has started
+    with patch.dict(os.environ, {"AUTO_DEPLOY": "true"}), patch("main.spawn", new=lambda c: c.close()):
+        main._coolify_down_since = 1.0
+        main._coolify_up([])
+    assert json.loads(main.PENDING_STATE_FILE.read_text())["missed"]["nextcloud:34"]["container"] == "nextcloud"
