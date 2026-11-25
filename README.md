@@ -173,6 +173,25 @@ tag). Only an `update` is looked up; the tag is never changed.
 database for about 30 s. The Coolify token must be allowed to list and restart databases.
 The `/deploy` link works for a standalone database too.
 
+### Side containers of compose applications
+
+A Coolify application built from a compose file (build pack `dockercompose`) can carry
+side containers on a public image (`mysql:8.4`, `redis:7-alpine`). Coolify names them
+`<service>-<application uuid>-<timestamp>`; when an `update` matches no service and no
+database, the uuid in that name is looked up among the applications. If one matches **and
+its compose file runs this very image** (same repository, same tag: `mysql:8.0` republished
+while the compose uses `mysql:8.4` deploys nothing; an application whose compose file is
+missing or unreadable is not deployed either), the **application is redeployed** (`POST /api/v1/deploy?uuid=`, which pulls the images), only
+with `AUTO_DEPLOY=true` (no other flag), through the same queue, window and lock as the
+services. Several side containers of one application in the same window make a single
+deployment, followed until Coolify reports it finished, with one line per container in the
+common report. A `new` event never deploys. Without `AUTO_DEPLOY`, a notification carries a
+deploy link. The `/deploy?uuid=` link now deploys any application Coolify knows (still
+protected by the secret). The report names a side container by its compose service (`db`).
+A container whose name carries no known application uuid is reported as before ("no deploy
+available"). The same checks apply when updates are replayed after a Coolify outage. The Coolify token
+must be allowed to list and deploy applications.
+
 ### `update` deploys, `new` only informs
 
 A redeploy always pulls the tag the Coolify resource is **configured** with; it never
