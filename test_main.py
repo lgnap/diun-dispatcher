@@ -19,11 +19,14 @@ def _isolated_image_versions(tmp_path):
     main._event_digests.clear()
     with patch.object(main, "VERSIONS_FILE", tmp_path / "image_versions.json"), \
          patch.object(main, "REBUILD_STATE_FILE", tmp_path / "rebuild_state.json"), \
+         patch.object(main, "PENDING_STATE_FILE", tmp_path / "pending_redeploys.json", create=True), \
          patch.object(main, "current_image_version", new=AsyncMock(return_value=None)), \
          patch.object(main, "get_coolify_databases", new=AsyncMock(return_value=[])):
         yield
     main._image_versions.clear()
     main._database_uuids.clear()
+    if hasattr(main, "_unconfirmed"):
+        main._unconfirmed.clear()
 
 
 def test_get_cloudflare_headers_with_both_credentials():
@@ -3588,3 +3591,779 @@ def test_replay_only_lists_a_missed_database_update_when_database_auto_deploy_is
 
     assert calls == []
     assert "mariadb-main" in notify.call_args.args[2] and "DATABASE_AUTO_DEPLOY" in notify.call_args.args[2]
+
+
+# ---------------------------------------------------------------------------
+# Pending redeploys survive a restart of the dispatcher (issue #24)
+# ---------------------------------------------------------------------------
+
+SELF_UUID = "dispatcher-uuid"
+STATE_ENV = {**NO_DEBOUNCE_ENV, "COOLIFY_RESOURCE_UUID": SELF_UUID}
+
+
+def _run_spawned(spawned):
+    import asyncio
+
+    async def run_all():
+        while spawned:
+            await spawned.pop(0)
+
+    asyncio.run(run_all())
+
+
+def _schedule(uuid, container, image, deploy_link="", server="srv"):
+    import main
+    return main.schedule_service_redeploy("http://c", "t", uuid, "running:healthy",
+                                          container, image, server, deploy_link)
+
+
+def _forget_memory():
+    """What a restart of the process does: the memory is gone, the files stay."""
+    import main
+    _reset_redeploy_state()
+    main._unconfirmed.clear()
+    main._coolify_missed.clear()
+    main._database_uuids.clear()
+    main._coolify_down_since = None
+
+
+def test_pending_state_file_holds_no_secret():
+    import main
+    _forget_memory()
+    link = "\n\nhttp://dispatcher/deploy?uuid=svc-1&secret=s3cret-value"
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        _schedule("svc-1", "nextcloud", "nextcloud:34", deploy_link=link)
+    text = main.PENDING_STATE_FILE.read_text()
+    assert "s3cret" not in text and "secret" not in text
+    state = json.loads(text)
+    assert state["redeploys"][0]["uuid"] == "svc-1"
+    assert state["redeploys"][0]["items"] == [["nextcloud", "nextcloud:34"]]
+
+
+def test_dispatcher_is_restarted_after_the_other_services_and_the_report():
+    _forget_memory()
+    timeline = []
+
+    async def trigger(url, token, uuid):
+        timeline.append(("trigger", uuid))
+        return {"ok": True, "deployment_uuid": None}
+
+    def notify(urls, title, body, **kwargs):
+        timeline.append(("report", title))
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification", new=notify):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        _run_spawned(spawned)
+
+    assert [e[:2] if e[0] == "trigger" else e[0] for e in timeline] == [
+        ("trigger", "svc-1"), "report", ("trigger", SELF_UUID)]
+
+
+def test_without_own_uuid_the_order_is_unchanged():
+    _forget_memory()
+    triggered = []
+
+    async def trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification"):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        _run_spawned(spawned)
+
+    assert triggered == [SELF_UUID, "svc-1"]
+
+
+def test_dispatcher_entry_is_erased_before_its_restart_is_requested():
+    """No restart loop: Coolify may stop the container before our call returns (CancelledError),
+    so the entry must be gone from the file before the call, the one exception to the
+    'erased once accepted' rule."""
+    import main
+    _forget_memory()
+    seen = {}
+
+    async def trigger(url, token, uuid):
+        seen["during"] = main.PENDING_STATE_FILE.exists() and \
+            [r["uuid"] for r in json.loads(main.PENDING_STATE_FILE.read_text())["redeploys"]]
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.send_notification"):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _run_spawned(spawned)
+
+    assert not seen["during"], "already gone while Coolify is being called"
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_dispatcher_entry_is_gone_even_if_the_process_is_stopped_during_its_restart():
+    import asyncio
+    import main
+    _forget_memory()
+
+    async def trigger(url, token, uuid):
+        raise asyncio.CancelledError()
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.send_notification"):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        try:
+            _run_spawned(spawned)
+        except asyncio.CancelledError:
+            pass
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_refused_restart_of_the_dispatcher_is_notified_as_a_failure():
+    _forget_memory()
+    notes = []
+
+    async def trigger(url, token, uuid):
+        return {"ok": False, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.send_notification", new=lambda urls, title, body, **k: notes.append((title, k))):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _run_spawned(spawned)
+
+    failures = [n for n in notes if "could not be triggered" in n[0]]
+    assert len(failures) == 1 and "❌" in failures[0][0]
+    assert not failures[0][1].get("info")
+
+
+def test_a_lone_dispatcher_restart_is_announced_before_it_happens():
+    _forget_memory()
+    timeline = []
+
+    async def trigger(url, token, uuid):
+        timeline.append("trigger")
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.send_notification", new=lambda *a, **k: timeline.append(("notify", k.get("info")))):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest")
+        _run_spawned(spawned)
+
+    assert timeline == [("notify", True), "trigger"]
+
+
+def test_a_stop_during_the_window_is_resumed_and_reported_at_next_start():
+    import main
+    _forget_memory()
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+    _forget_memory()  # the dispatcher is stopped and started again
+
+    triggered, notes = [], []
+
+    async def trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    async def watch(url, token, uuid, baseline, **kwargs):
+        kwargs["outcomes"].append((kwargs["container_name"], kwargs["image"], True, "deployed"))
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.send_notification", new=lambda urls, title, body, **k: notes.append((title, k))):
+        main.resume_pending()
+        _run_spawned(spawned)
+
+    assert triggered == ["svc-1"]
+    assert len(notes) == 1
+    assert "Resumed" in notes[0][0] and "1 redeployed" in notes[0][0]
+    assert notes[0][1]["info"] is True  # NOTIFY_LEVEL=failures drops a good report
+    assert not main.PENDING_STATE_FILE.exists()  # nothing left to resume
+
+
+def test_a_stop_mid_batch_resumes_at_the_service_not_yet_restarted():
+    import asyncio
+    import main
+    _forget_memory()
+
+    async def trigger(url, token, uuid):
+        if uuid == "svc-2":
+            raise asyncio.CancelledError()  # the process is stopped here
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification"):
+        _schedule("svc-1", "a", "a:1")
+        _schedule("svc-2", "b", "b:1")
+        try:
+            _run_spawned(spawned)
+        except asyncio.CancelledError:
+            pass
+
+    assert [r["uuid"] for r in json.loads(main.PENDING_STATE_FILE.read_text())["redeploys"]] == ["svc-2"]
+
+
+def test_missing_or_unreadable_state_does_not_block_startup(caplog):
+    import main
+    _forget_memory()
+    with patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()  # no file
+        assert main._batch_queue == []
+        main.PENDING_STATE_FILE.write_text("{not json")
+        with caplog.at_level("WARNING"):
+            main.resume_pending()
+    assert main._batch_queue == [] and main._pending_redeploys == {}
+    assert "Could not read" in caplog.text
+    main.PENDING_STATE_FILE.write_text('{"redeploys": "oops", "missed": 3}')
+    with patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()
+    assert main._batch_queue == []
+
+
+def test_resumed_database_entry_still_goes_to_the_databases_api():
+    import main
+    _forget_memory()
+    with patch.dict(os.environ, {**STATE_ENV, "DATABASE_AUTO_DEPLOY": "true"}, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        main._database_uuids.add("db-uuid")
+        _schedule("db-uuid", "db-uuid", "mariadb:11")
+    _forget_memory()
+    with patch.dict(os.environ, {**STATE_ENV, "DATABASE_AUTO_DEPLOY": "true"}, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()
+    assert "db-uuid" in main._database_uuids
+    assert main._batch_queue == ["db-uuid"]
+
+
+def test_missed_updates_are_kept_and_replayed_after_a_restart():
+    import main
+    _forget_memory()
+    main.coolify_down_response("nextcloud", "nextcloud:34", "update", "host")
+    assert json.loads(main.PENDING_STATE_FILE.read_text())["missed"]["nextcloud:34"]["container"] == "nextcloud"
+    _forget_memory()
+    probes = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.probe_coolify_until_back", new=lambda: probes.append(1) or AsyncMock()()), \
+         patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()
+    assert main._coolify_missed["nextcloud:34"]["hostname"] == "host"
+    assert main.coolify_is_down() and probes == [1]
+
+
+def test_coolify_back_empties_the_persisted_missed_list():
+    import main
+    _reset_coolify_state()
+    main.coolify_down_response("nextcloud", "nextcloud:34", "update", "host")
+    with patch("main.spawn", new=lambda c: c.close()), patch("main.send_notification"):
+        main._coolify_down_since = 1.0
+        main._coolify_up([])
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_missed_updates_stay_on_disk_until_their_replay_has_taken_them_over():
+    import main
+    _reset_coolify_state()
+    main.coolify_down_response("nextcloud", "nextcloud:34", "update", "host")
+    # Coolify is back, but the dispatcher stops before the replay has started
+    with patch.dict(os.environ, {"AUTO_DEPLOY": "true"}), patch("main.spawn", new=lambda c: c.close()):
+        main._coolify_down_since = 1.0
+        main._coolify_up([])
+    assert json.loads(main.PENDING_STATE_FILE.read_text())["missed"]["nextcloud:34"]["container"] == "nextcloud"
+
+
+# ---------------------------------------------------------------------------
+# Issue #24, review fixes
+# ---------------------------------------------------------------------------
+
+def _state():
+    import main
+    return json.loads(main.PENDING_STATE_FILE.read_text())
+
+
+def _resume_and_run(env=STATE_ENV, trigger=None, notes=None):
+    """Start the dispatcher again and let what it spawned run."""
+    import main
+    triggered = []
+
+    async def default_trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    async def watch(url, token, uuid, baseline, **kwargs):
+        kwargs["outcomes"].append((kwargs["container_name"], kwargs["image"], True, "deployed"))
+
+    spawned = []
+    notes = notes if notes is not None else []
+    with patch.dict(os.environ, env, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger or default_trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.send_notification", new=lambda urls, title, body, **k: notes.append((title, body, k))):
+        main.resume_pending()
+        _run_spawned(spawned)
+    return triggered, notes
+
+
+def _stopped_with(*updates, env=STATE_ENV):
+    """The dispatcher scheduled these (uuid, container, image) then was stopped."""
+    _forget_memory()
+    with patch.dict(os.environ, env, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        for u in updates:
+            _schedule(*u)
+    _forget_memory()
+
+
+def test_a_refused_restart_stays_in_the_file_and_is_retried_at_next_start():
+    import main
+    _forget_memory()
+
+    async def refuse(url, token, uuid):
+        return {"ok": False, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=refuse), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.send_notification"):
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        _run_spawned(spawned)
+    assert [r["uuid"] for r in _state()["redeploys"]] == ["svc-1"]
+    assert isinstance(_state()["redeploys"][0]["since"], float)
+
+
+def test_resume_with_coolify_not_answering_reports_the_failure_and_keeps_the_entry():
+    import main
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+
+    async def refuse(url, token, uuid):
+        return {"ok": False, "deployment_uuid": None}
+
+    triggered, notes = _resume_and_run(trigger=refuse)
+    assert len(notes) == 1 and "❌" in notes[0][0] and not notes[0][2].get("info")
+    assert [r["uuid"] for r in _state()["redeploys"]] == ["svc-1"]
+
+
+def test_an_entry_older_than_a_day_is_dropped_at_resume(caplog):
+    import main
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"), ("svc-2", "gitea", "gitea:1"))
+    state = _state()
+    state["redeploys"][0]["since"] = 1.0  # long ago
+    main.PENDING_STATE_FILE.write_text(json.dumps(state))
+    with caplog.at_level("WARNING"):
+        triggered, _ = _resume_and_run()
+    assert triggered == ["svc-2"]
+    assert "svc-1" in caplog.text and "abandon" in caplog.text.lower()
+    assert main.PENDING_ENTRY_MAX_AGE_SECONDS == 24 * 60 * 60
+
+
+def test_two_entries_for_one_uuid_in_memory_make_one_entry_in_the_file():
+    import main
+    _forget_memory()
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        main._track_unconfirmed({"uuid": "svc-1", "containers": ["redis", "nextcloud"],
+                                 "images": ["redis:7", "nextcloud:34"],
+                                 "items": [("redis", "redis:7"), ("nextcloud", "nextcloud:34")],
+                                 "baseline": "", "server": "srv", "deploy_link": "", "since": time.time()})
+    entries = _state()["redeploys"]
+    assert len(entries) == 1
+    assert entries[0]["containers"] == ["nextcloud", "redis"]
+    assert entries[0]["images"] == ["nextcloud:34", "redis:7"]
+    assert entries[0]["items"] == [["nextcloud", "nextcloud:34"], ["redis", "redis:7"]]
+
+
+def test_a_file_with_the_same_uuid_twice_is_resumed_as_one_restart_with_one_report():
+    import main
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    state = _state()
+    other = {**state["redeploys"][0], "containers": ["redis"], "images": ["redis:7"],
+             "items": [["redis", "redis:7"]]}
+    state["redeploys"].append(other)
+    main.PENDING_STATE_FILE.write_text(json.dumps(state))
+    triggered, notes = _resume_and_run()
+    assert triggered == ["svc-1"]
+    assert len(notes) == 1 and "1 redeployed" in notes[0][0]
+    assert "nextcloud" in notes[0][1] and "redis" in notes[0][1]
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_the_batch_ignores_a_queued_uuid_without_pending_entry():
+    import main
+    _forget_memory()
+    main._batch_queue.extend(["ghost", "svc-1", "svc-1"])
+    main._pending_redeploys["svc-1"] = {
+        "containers": ["a"], "images": ["a:1"], "items": [("a", "a:1")], "uuid": "svc-1",
+        "baseline": "", "server": "srv", "deploy_link": "", "since": time.time()}
+    triggered = []
+
+    async def trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    async def watch(url, token, uuid, baseline, **kwargs):
+        kwargs["outcomes"].append(("a", "a:1", True, "deployed"))
+
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: c.close()), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.send_notification"):
+        import asyncio
+        asyncio.run(main._run_batch("http://c", "t", resumed=True))
+    assert triggered == ["svc-1"]
+
+
+def test_memory_and_file_stay_consistent_when_the_batch_dies_of_an_exception():
+    import main
+    _forget_memory()
+    spawned = []
+
+    async def boom(*a, **k):
+        raise RuntimeError("report failed")
+
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.run_redeploys", new=lambda *a, **k: boom()):
+        _schedule("svc-1", "a", "a:1")
+        _schedule("svc-2", "b", "b:1")
+        try:
+            _run_spawned(spawned)
+        except RuntimeError:
+            pass
+    assert main._pending_redeploys == {} and main._batch_queue == [] and main._batch_running is False
+    # nothing lost: both still wait in the file for the next start
+    assert [r["uuid"] for r in _state()["redeploys"]] == ["svc-1", "svc-2"]
+
+
+def test_a_new_update_after_a_refused_restart_does_not_leave_a_ghost():
+    """Refused (stays in file), then a new update for the same service, accepted: one restart
+    pulled everything, nothing is left to retry."""
+    import main
+    _forget_memory()
+    answers = iter([False, True])
+
+    async def trigger(url, token, uuid):
+        return {"ok": next(answers), "deployment_uuid": None}
+
+    async def watch(url, token, uuid, baseline, **kwargs):
+        kwargs["outcomes"].append((kwargs["container_name"], kwargs["image"], True, "deployed"))
+
+    spawned = []
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.send_notification"):
+        _schedule("svc-1", "a", "a:1")
+        _run_spawned(spawned)
+        assert [r["uuid"] for r in _state()["redeploys"]] == ["svc-1"]
+        _schedule("svc-1", "a", "a:2")
+        assert len(_state()["redeploys"]) == 1  # merged in the file
+        _run_spawned(spawned)
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_resume_does_not_restart_without_auto_deploy_and_notifies_once_with_links():
+    import main
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"), ("svc-2", "gitea", "gitea:1"))
+    env = {**STATE_ENV, "DISPATCHER_URL": "http://dispatcher"}
+    del env["AUTO_DEPLOY"]
+    triggered, notes = _resume_and_run(env=env)
+    assert triggered == []
+    assert len(notes) == 1
+    title, body, kwargs = notes[0]
+    assert not kwargs.get("info")
+    assert "nextcloud" in body and "gitea" in body and "/deploy?uuid=" in body
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_resume_leaves_a_database_alone_without_database_auto_deploy():
+    import main
+    _forget_memory()
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        main._database_uuids.add("db-uuid")
+        _schedule("db-uuid", "db-uuid", "mariadb:11")
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+    _forget_memory()
+    triggered, notes = _resume_and_run(env={**STATE_ENV, "DISPATCHER_URL": "http://dispatcher"})
+    assert triggered == ["svc-1"]
+    announcements = [n for n in notes if "mariadb" in n[1]]
+    assert len(announcements) == 1 and not announcements[0][2].get("info")
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_the_state_file_is_written_atomically():
+    import main
+    _forget_memory()
+    replaced = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        replaced.append((str(src), str(dst), os.path.exists(src)))
+        return real_replace(src, dst)
+
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()), \
+         patch("main.os.replace", new=spy):
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+    assert len(replaced) == 1
+    src, dst, existed = replaced[0]
+    assert dst == str(main.PENDING_STATE_FILE) and src != dst and existed
+    assert [p.name for p in main.PENDING_STATE_FILE.parent.iterdir()] == ["pending_redeploys.json"]
+
+
+def test_replay_restarts_the_dispatcher_last_after_the_report():
+    import main
+    _forget_memory()
+    timeline = []
+
+    async def trigger(url, token, uuid):
+        timeline.append(("trigger", uuid))
+        return {"ok": True, "deployment_uuid": None}
+
+    async def watch(url, token, uuid, baseline, **kwargs):
+        kwargs["outcomes"].append((kwargs["container_name"], kwargs["image"], True, "deployed"))
+
+    own = {**MATCHING_SERVICE, "uuid": SELF_UUID,
+           "applications": [{"name": "dispatcher", "image": "ghcr.io/example/diun-dispatcher:latest"}]}
+    missed = _missed(("ghcr.io/example/diun-dispatcher:latest", "dispatcher", "update"),
+                     ("docker.io/gitea/gitea:1.27", "gitea", "update"))
+    import asyncio
+    with patch.dict(os.environ, {**STATE_ENV, "DEPLOY_PAUSE_SECONDS": "0"}, clear=True), \
+         patch("main.spawn", new=lambda c: c.close()), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=watch), \
+         patch("main.send_notification", new=lambda urls, title, body, **k: timeline.append(("report", title))):
+        asyncio.run(main.replay_missed([own, SECOND_SERVICE], missed))
+    assert [e if e[0] == "report" else e for e in timeline][0] == ("trigger", "svc-2")
+    assert [e[0] for e in timeline] == ["trigger", "report", "trigger"]
+    assert timeline[-1] == ("trigger", SELF_UUID)
+    assert not main.PENDING_STATE_FILE.exists()
+
+
+def test_replay_tracks_its_groups_in_the_file_while_it_runs():
+    import asyncio
+    import main
+    _forget_memory()
+    seen = {}
+
+    async def fake_run(url, token, next_group):
+        seen["file"] = _state()["redeploys"]
+        return []
+
+    missed = _missed(("docker.io/library/nextcloud:34-apache", "nextcloud", "update"))
+    with patch.dict(os.environ, {"COOLIFY_API_URL": "http://c", "COOLIFY_TOKEN": "t", "AUTO_DEPLOY": "true"},
+                    clear=True), \
+         patch("main.run_redeploys", new=fake_run), patch("main.send_notification"):
+        asyncio.run(main.replay_missed([MATCHING_SERVICE], missed))
+    assert [r["uuid"] for r in seen["file"]] == [MATCHING_SERVICE["uuid"]]
+    assert seen["file"][0]["containers"] == ["nextcloud"]
+
+
+def test_startup_event_resumes_the_pending_redeploys():
+    import asyncio
+    import main
+    with patch("main.resume_pending") as resume, \
+         patch("main.series_check_loop", new=MagicMock(return_value=None)), \
+         patch("main.asyncio.create_task", new=MagicMock()):
+        asyncio.run(main.startup_event())
+    resume.assert_called_once_with()
+
+
+def test_merging_an_update_into_a_waiting_restart_is_saved():
+    _forget_memory()
+    with patch.dict(os.environ, STATE_ENV, clear=True), patch("main.spawn", new=lambda c: c.close()):
+        assert _schedule("svc-1", "nextcloud", "nextcloud:34") == "auto-deploy-scheduled"
+        assert _schedule("svc-1", "redis", "redis:7") == "auto-deploy-merged"
+    entry = _state()["redeploys"][0]
+    assert entry["containers"] == ["nextcloud", "redis"]
+    assert entry["items"] == [["nextcloud", "nextcloud:34"], ["redis", "redis:7"]]
+
+
+def test_malformed_entries_are_ignored_with_a_warning_and_the_valid_ones_resumed(caplog):
+    import main
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    good = _state()["redeploys"][0]
+    bad = ["not a dict", {"containers": ["x"]}, {"uuid": "svc-9"},
+           {"uuid": "svc-8", "containers": 5, "images": [], "items": []}]
+    main.PENDING_STATE_FILE.write_text(json.dumps({"redeploys": [*bad, good], "missed": {}}))
+    with caplog.at_level("WARNING"):
+        triggered, notes = _resume_and_run()
+    assert triggered == ["svc-1"]
+    assert "Ignoring" in caplog.text
+
+
+def test_a_json_array_at_the_root_does_not_block_startup(caplog):
+    import main
+    _forget_memory()
+    main.PENDING_STATE_FILE.write_text("[1, 2]")
+    with caplog.at_level("WARNING"), patch("main.spawn", new=lambda c: c.close()):
+        main.resume_pending()
+    assert "unexpected content" in caplog.text and main._batch_queue == []
+
+
+def test_resume_does_not_go_through_the_grouping_window():
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    slept = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    with patch("main.asyncio.sleep", new=sleep):
+        triggered, _ = _resume_and_run(env={**STATE_ENV, "DEPLOY_DEBOUNCE_SECONDS": "7"})
+    assert triggered == ["svc-1"]
+    assert 7 not in slept and 7.0 not in slept
+
+
+# ---------------------------------------------------------------------------
+# Issue #24, third review: no second restart at resume, `since`, unwritable state
+# ---------------------------------------------------------------------------
+
+def _requested_ago(seconds, uuid="svc-1"):
+    """Edit the file: the restart of `uuid` was requested `seconds` ago (None: never)."""
+    import main
+    state = _state()
+    for entry in state["redeploys"]:
+        if entry["uuid"] == uuid:
+            if seconds is None:
+                entry.pop("requested", None)
+            else:
+                entry["requested"] = time.time() - seconds
+    main.PENDING_STATE_FILE.write_text(json.dumps(state))
+
+
+def _resume_recording_sleeps():
+    """Resume, with every sleep recorded; also what the trigger saw when it ran."""
+    import main
+    log = []
+
+    async def sleep(seconds):
+        log.append(("sleep", seconds, main.service_restart_lock("svc-1").locked(),
+                    "svc-1" in main._pending_redeploys))
+
+    async def trigger(url, token, uuid):
+        log.append(("trigger", uuid))
+        return {"ok": True, "deployment_uuid": None}
+
+    with patch("main.asyncio.sleep", new=sleep):
+        _resume_and_run(trigger=trigger)
+    return log, [e[1] for e in log if e[0] == "trigger"]
+
+
+def test_resume_waits_for_the_rest_of_the_hold_after_a_recent_request():
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    _requested_ago(30)
+    log, triggered = _resume_recording_sleeps()
+    assert triggered == ["svc-1"], "one restart only"
+    assert log[0][0] == "sleep" and log[0][1] == pytest.approx(270, abs=3)
+    assert log.index(("trigger", "svc-1")) > 0, "no call to Coolify before the wait"
+    assert log[0][2] is True, "the service lock is held during the wait (/deploy refused)"
+
+
+def test_resume_does_not_wait_when_the_request_is_older_than_the_hold():
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    _requested_ago(6 * 60)
+    log, triggered = _resume_recording_sleeps()
+    assert triggered == ["svc-1"]
+    assert [e for e in log if e[0] == "sleep"] == []
+
+
+def test_resume_does_not_wait_for_an_entry_never_requested():
+    _stopped_with(("svc-1", "nextcloud", "nextcloud:34"))
+    _requested_ago(None)
+    log, triggered = _resume_recording_sleeps()
+    assert triggered == ["svc-1"]
+    assert [e for e in log if e[0] == "sleep"] == []
+
+
+def test_the_request_time_is_on_disk_while_coolify_is_being_called():
+    import asyncio
+    import main
+    _forget_memory()
+    seen = []
+
+    async def trigger(url, token, uuid):
+        seen.append(_state()["redeploys"][0].get("requested"))
+        raise asyncio.CancelledError()  # stopped during the call
+
+    spawned = []
+    with patch.dict(os.environ, NO_DEBOUNCE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.send_notification"):
+        before = time.time()
+        _schedule("svc-1", "nextcloud", "nextcloud:34")
+        try:
+            _run_spawned(spawned)
+        except asyncio.CancelledError:
+            pass
+    assert seen and seen[0] >= before, "written before the call"
+    assert _state()["redeploys"][0]["requested"] == seen[0], "still there after the stop"
+
+
+def test_merging_keeps_the_most_recent_since_and_request_time():
+    import main
+    base = {"uuid": "svc-1", "containers": ["a"], "images": ["a:1"], "items": [("a", "a:1")],
+            "baseline": "", "server": "srv"}
+    merged = main._merge_entries([{**base, "since": 100.0, "requested": 500.0},
+                                  {**base, "since": 900.0, "requested": 300.0}])
+    assert merged[0]["since"] == 900.0 and merged[0]["requested"] == 500.0
+    merged = main._merge_entries([{**base, "since": 900.0}, {**base, "since": 100.0, "requested": 7.0}])
+    assert merged[0]["since"] == 900.0 and merged[0]["requested"] == 7.0
+
+
+def test_the_dispatcher_does_not_restart_itself_when_its_state_cannot_be_written():
+    _forget_memory()
+    triggered, notes = [], []
+
+    async def trigger(url, token, uuid):
+        triggered.append(uuid)
+        return {"ok": True, "deployment_uuid": None}
+
+    spawned = []
+    with patch.dict(os.environ, STATE_ENV, clear=True), \
+         patch("main.spawn", new=lambda c: spawned.append(c)), \
+         patch("main.trigger_coolify", new=trigger), \
+         patch("main.get_service_status", new=AsyncMock(return_value="running:healthy")), \
+         patch("main.watch_deployment", new=AsyncMock()), \
+         patch("main.send_notification", new=lambda urls, title, body, **k: notes.append((title, body, k))):
+        _schedule(SELF_UUID, "dispatcher", "ghcr.io/example/diun-dispatcher:latest",
+                  deploy_link="\n\nhttp://d/deploy?uuid=x")
+        with patch("main._save_pending_state", return_value=False):
+            _run_spawned(spawned)
+    assert triggered == [], "the dispatcher stays up"
+    failures = [n for n in notes if n[2].get("info") is not True]
+    assert failures and "http://d/deploy?uuid=x" in failures[-1][1]

@@ -74,7 +74,8 @@ See [`docker-compose.yml`](docker-compose.yml) for a complete example.
 | `COOLIFY_PROBE_SECONDS` | `120` | While Coolify is unreachable, how often the dispatcher retries it. See [When Coolify is unreachable](#when-coolify-is-unreachable) |
 | `IGNORE_CONTAINERS`   | (none)  | Comma-separated container names to skip (e.g., `test-app,staging-db`) |
 | `SERIES_CHECK_HOUR`   | `5`     | Hour of the day (0-23, container time zone) of the daily virtual series check |
-| `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file |
+| `CACHE_FILE`          | `/data/uuid_cache.json` | Path for UUID cache file. The other state files (`image_versions.json`, `rebuild_state.json`, `pending_redeploys.json`) live next to it, so `/data` must be a volume |
+| `COOLIFY_RESOURCE_UUID` | (set by Coolify) | The Coolify uuid of the dispatcher's own service, injected into the container by Coolify. Used to restart the dispatcher last. See [Restarts and the dispatcher's own update](#restarts-and-the-dispatchers-own-update) |
 | `CF_ACCESS_CLIENT_ID` | (none)  | Cloudflare Access client ID (if behind Cloudflare Access) |
 | `CF_ACCESS_CLIENT_SECRET` | (none) | Cloudflare Access client secret |
 
@@ -306,6 +307,44 @@ recreated — and a request that timed out on our side may still have been accep
 Only restarts requested through the dispatcher are coordinated: one started from
 Coolify's UI at the same moment is not.
 
+### Restarts and the dispatcher's own update
+
+Diun reports an `update` only once, so a restart the dispatcher forgets would leave the service
+outdated for good. The restarts waiting in the window or in the queue, and the updates missed
+while Coolify was unreachable, are therefore kept in `pending_redeploys.json` next to
+`CACHE_FILE` (so `/data` must be a volume). An entry is erased only once Coolify has accepted
+its restart: a stop in the middle of a batch resumes at the right service, and a restart Coolify
+refused or did not answer (for instance because the host just rebooted and Coolify is not up
+yet) is reported as a failure but stays in the file and is tried again at the next start. An
+entry older than 24 hours is abandoned at the start, with a warning in the log, so that a
+restart that is always refused is not retried forever. At the next start the pending restarts
+run as a batch of their own (no grouping window), closed by one report titled
+`Resumed after a restart`; missed updates are replayed as soon as Coolify answers (the first
+probe comes `COOLIFY_PROBE_SECONDS` after the start). `AUTO_DEPLOY` is read again at that
+moment (changing a variable in Coolify restarts the dispatcher): without it, nothing is
+restarted, one notification lists the pending resources with their deploy links, and they are
+erased from the file; a standalone database also needs `DATABASE_AUTO_DEPLOY`. A missing,
+unreadable or partly malformed file only logs a warning (the valid entries are still resumed).
+The file holds no secret: deploy links are rebuilt on resume.
+
+The time of each restart request is written to the file **before** the call to Coolify. A request
+that got no answer (timeout, or the dispatcher stopped during the call) may nevertheless have been
+accepted: the entry is kept, and at the next start the service is not restarted again until the
+5-minute hold has elapsed since that original request (the service stays locked meanwhile, so
+`/deploy` refuses it), so that two restarts never overlap. Entries never requested (stop during the
+grouping window) restart immediately. The only remaining case is a restart accepted by Coolify but
+whose request time could not be written to the file.
+
+When the dispatcher's own service (`COOLIFY_RESOURCE_UUID`, which Coolify injects into the
+container) is part of a batch, it is restarted **last**: after the other services and after the
+report, which says that the dispatcher restarts itself. That restart is not followed (the
+process is replaced), so there is no outcome for it; if Coolify refuses it, a failure is
+notified. This is the one exception to "erased once accepted": the dispatcher's entry is erased
+just **before** the request, because Coolify may stop the container before the answer is
+handled and the new container would otherwise restart itself again, in a loop. A refused
+restart is therefore not retried at the next start: the failure notification carries the
+deploy link. If the state file cannot be written (disk full, read-only `/data`), the dispatcher does **not** restart itself (it would restart at every start for 24 hours): a failure notification with the deploy link is sent instead. The same order applies when the updates are replayed after a Coolify outage. Without `COOLIFY_RESOURCE_UUID` the order is unchanged.
+
 ## Virtual series: follow patches without a series tag
 
 Pinning on a series tag only works when the publisher publishes one. Some don't:
@@ -523,8 +562,8 @@ send one notification per Diun alert:
 
 1. The first failed call sends one `❌ Coolify unreachable — deployments paused` notification.
 2. While Coolify is down, Diun alerts are answered `200` with `action: coolify-down`, without
-   any Coolify call or notification. The image is only remembered, in memory (lost if the
-   dispatcher restarts). The daily series check is skipped.
+   any Coolify call or notification. The image is only remembered (kept in `pending_redeploys.json`, so a
+   restart of the dispatcher does not lose it). The daily series check is skipped.
 3. Every `COOLIFY_PROBE_SECONDS` (default 120) the dispatcher retries Coolify.
 4. When it answers, the updates reported meanwhile are handled as the webhook would have:
    - with `AUTO_DEPLOY`, an `update` of the tag in service is redeployed, one service at a time

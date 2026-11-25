@@ -14,7 +14,7 @@ tests dans `test_main.py` (pytest). CI : `.github/workflows/docker.yml` publie
 l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 
 ## Commandes (vérifiées le 2026-10-08)
-- Tests : `.venv/bin/python -m pytest -q` (301 tests, environ 2 s).
+- Tests : `.venv/bin/python -m pytest -q` (339 tests, environ 2 s).
 - Lancer en local : `.venv/bin/uvicorn main:app --reload --port 8000` (avec un `.env`).
 - Conteneur : **Podman**, pas Docker, sur ce poste (`podman build -t diun-dispatcher .`).
 
@@ -22,7 +22,7 @@ l'image sur ghcr (push sur `main`, tags `v*`, lancement manuel possible).
 Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLIFY_TOKEN`,
 `WEBHOOK_SECRET` (obligatoire). Optionnelles : `AUTO_DEPLOY`, `DATABASE_AUTO_DEPLOY`, `DEPLOY_DEBOUNCE_SECONDS`,
 `DISPATCHER_URL`, `APPRISE_URLS`, `NOTIFY_LEVEL`, `COOLIFY_PROBE_SECONDS`, `DEPLOY_PAUSE_SECONDS`, `IGNORE_CONTAINERS`, `SERIES_CHECK_HOUR`, `CACHE_FILE`,
-`CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`.
+`COOLIFY_RESOURCE_UUID` (injecté par Coolify), `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`.
 
 ## Conventions
 - TDD : tests d'abord ; horloge simulée, aucune attente réelle (la suite doit rester rapide).
@@ -67,13 +67,14 @@ Requises : `COOLIFY_API_URL` (jamais `COOLIFY_URL`, que Coolify écrase), `COOLI
   toutes les `COOLIFY_PROBE_SECONDS`. Au retour, avec `AUTO_DEPLOY`, rejeu un service à la
   fois (`DEPLOY_PAUSE_SECONDS` entre deux, seul un `update` du tag en service) et UN
   seul compte rendu final ; sinon une notification qui liste les mises à jour manquées. File
-  en mémoire. Ne pas remettre une notification par alerte Diun.
+  persistée dans `pending_redeploys.json` (voir ci-dessous). Ne pas remettre une notification par alerte Diun.
 - Base de données autonome Coolify (issue #25) : cherchée seulement si aucun service ne correspond et
   pour un `update` ; conteneur nommé par l'uuid de la base, même dépôt et même tag. Redémarrée par
   `databases/{uuid}/restart` (tire l'image) dans la même file que les services, seulement avec
   `AUTO_DEPLOY` **et** `DATABASE_AUTO_DEPLOY` (défaut `false`) ; sinon annonce avec lien, envoyée même en
   `NOTIFY_LEVEL=failures` si `AUTO_DEPLOY` est actif. `GET /api/v1/databases` contient les mots de passe
   des bases : ne jamais journaliser sa réponse. `_database_uuids` aiguille restart et statut vers `/databases`.
+- Redéploiements en attente persistés (issue #24) : `pending_redeploys.json` (à côté de `CACHE_FILE`, volume `/data`, écriture atomique via fichier `.tmp` + `os.replace`) garde les redémarrages non acceptés par Coolify (`_unconfirmed`, dans l'ordre, un enregistrement par uuid fusionné à l'écriture, `since` = création) et `_coolify_missed` ; relus au démarrage (`resume_pending`), lot de reprise sans fenêtre de regroupement avec rapport « Resumed after a restart » ; reprise des manqués via la sonde Coolify habituelle. Une entrée n'est effacée qu'après acceptation (`result["ok"]`) : un refus la laisse, retentée au démarrage suivant, abandonnée après 24 h (`PENDING_ENTRY_MAX_AGE_SECONDS`). La reprise relit `AUTO_DEPLOY`/`DATABASE_AUTO_DEPLOY` : sinon une notification (non `info`) avec liens, entrées effacées. Pas de `deploy_link` dans le fichier (il contient `WEBHOOK_SECRET`) : reconstruit. Le dispatcher (`COOLIFY_RESOURCE_UUID`) est redémarré en dernier, après le rapport (lot et rejeu), sans suivi ; **exception assumée** : son entrée est effacée AVANT l'appel à Coolify (Coolify peut tuer le conteneur avant la réponse : sinon boucle de redémarrage) ; un refus notifie l'échec avec le lien. L'heure de la demande (`requested`, la plus récente à la fusion, comme `since`) est écrite AVANT l'appel Coolify ; à la reprise `_last_restart_request` est réinitialisé et `run_redeploys` attend `hold_after_restart` (verrou tenu, `/deploy` refusé) : jamais deux redémarrages simultanés d'un service. `_save_pending_state` renvoie un booléen : si l'effacement de l'entrée du dispatcher n'est pas écrit, il ne se redémarre pas (notification d'échec avec lien).
 - Image de base : reconstruction une à une, arrêt au premier échec, autre majeure = annonce. Un redémarrage du dispatcher au milieu d'une reconstruction la reprend au démarrage suivant (`rebuild_state.json` dans `/data`, volume obligatoire) : ne pas redéployer le dispatcher n'est plus nécessaire, mais le déploiement en cours se termine côté Coolify. Ne jamais afficher `WEBHOOK_SECRET` ni le jeton Coolify (ni dans les journaux).
 
 ## Reprise de session
